@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# 添加权限配置，只授予创建release所需的最小权限
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,5 +36,4 @@ jobs:
         files: |
           webpimg-windows-amd64.exe
           webpimg-linux-amd64
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 移除env部分，因为已经在顶部设置了权限
