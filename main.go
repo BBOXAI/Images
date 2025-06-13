@@ -38,9 +38,17 @@ var (
 	cacheMisses  int64
 	cacheMutex   sync.RWMutex
 	maxCacheSize = int64(100 * 1024 * 1024) // 100MB
+	localTZ      *time.Location
 )
 
 func main() {
+	var err error
+	localTZ, err = time.LoadLocation("Asia/Shanghai") // 中国时区
+	if err != nil {
+		log.Printf("加载时区失败，使用本地时区: %v", err)
+		localTZ = time.Local
+	}
+
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Fatalf("创建缓存目录失败: %v", err)
 	}
@@ -66,13 +74,11 @@ func main() {
 
 func initDB() {
 	var err error
-	// 修改驱动名称从sqlite3为sqlite
 	db, err = sql.Open("sqlite", "./imgproxy.db")
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
 	}
 
-	// 	Setting database parameters
 	_, err = db.Exec(`PRAGMA journal_mode = WAL;
 		PRAGMA synchronous = NORMAL;
 		PRAGMA temp_store = MEMORY;
@@ -81,7 +87,6 @@ func initDB() {
 		log.Printf("Setting database parameters failed: %v", err)
 	}
 
-	// 	Create cache table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS cache (
 		url TEXT PRIMARY KEY,
 		file_path TEXT,
@@ -95,7 +100,6 @@ func initDB() {
 		log.Fatalf("Creating cache table failed: %v", err)
 	}
 
-	// 	Create stats table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS stats (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		total_requests INTEGER DEFAULT 0,
@@ -108,7 +112,6 @@ func initDB() {
 		log.Fatalf("Creating stats table failed: %v", err)
 	}
 
-	// 初始化统计记录
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM stats").Scan(&count)
 	if err != nil {
@@ -122,7 +125,6 @@ func initDB() {
 		}
 	}
 
-	// 加载请求计数
 	err = db.QueryRow("SELECT total_requests FROM stats WHERE id = 1").Scan(&requestCount)
 	if err != nil {
 		log.Printf("Querying total requests failed: %v，using default value 0", err)
@@ -130,17 +132,15 @@ func initDB() {
 	}
 }
 
-// 定期清理过期的缓存文件
 func cleanExpiredCache() {
 	for {
 		time.Sleep(6 * time.Hour) //  Expired cache every 6 hours
 		log.Println("Starting to clean expired cache...")
 
 		dbMutex.Lock()
-		// 查询需要清理的缓存记录
 		rows, err := db.Query(`
 			SELECT url, file_path, access_count, last_access FROM cache
-			WHERE last_access < datetime('now', '-10 minutes')
+			WHERE datetime(last_access, 'localtime') < datetime('now', 'localtime', '-10 minutes')
 		`)
 		if err != nil {
 			log.Printf("Querying expired cache failed: %v", err)
@@ -155,18 +155,22 @@ func cleanExpiredCache() {
 		for rows.Next() {
 			var url, filePath string
 			var accessCount int
-			var lastAccess time.Time
-			if err := rows.Scan(&url, &filePath, &accessCount, &lastAccess); err != nil {
+			var lastAccessStr string
+			if err := rows.Scan(&url, &filePath, &accessCount, &lastAccessStr); err != nil {
 				log.Printf("Reading cache record failed: %v", err)
 				continue
 			}
 
-			// 统一缓存有效期为10分钟
+			lastAccess, err := parseDBTime(lastAccessStr)
+			if err != nil {
+				log.Printf("解析时间失败: %v", err)
+				continue
+			}
+
 			expireMinutes := 10
 
-			// 检查是否真的过期
 			expireTime := lastAccess.Add(time.Duration(expireMinutes) * time.Minute)
-			if time.Now().After(expireTime) {
+			if time.Now().In(localTZ).After(expireTime) {
 				expiredURLs = append(expiredURLs, url)
 				expiredFiles = append(expiredFiles, filePath)
 				count++
@@ -174,14 +178,11 @@ func cleanExpiredCache() {
 		}
 		rows.Close()
 
-		// 	Deleting expired cache files
 		for i, filePath := range expiredFiles {
-			// 	Deleting cache file
 			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 				log.Printf("Deleting expired cache file failed %s: %v", filePath, err)
 			}
 
-			// 	Deleting cache record
 			_, err := db.Exec("DELETE FROM cache WHERE url = ?", expiredURLs[i])
 			if err != nil {
 				log.Printf("Deleting cache record failed: %v", err)
@@ -193,15 +194,11 @@ func cleanExpiredCache() {
 	}
 }
 
-// Generating cache file path
 func getCacheFilePath(imageURL string, format string) string {
-	// 	Generating cache file name
-	// 	Using MD5 hash to create unique file name
 	hasher := md5.New()
 	hasher.Write([]byte(imageURL))
 	hash := hex.EncodeToString(hasher.Sum(nil))
 
-	// 	Determining file extension based on image format
 	var ext string
 	switch format {
 	case "png":
@@ -215,28 +212,26 @@ func getCacheFilePath(imageURL string, format string) string {
 	return filepath.Join(cacheDir, hash+ext)
 }
 
-// Updating cache record
 func updateCacheRecord(imageURL, filePath, thumbPath, format string, isHit bool, originalSize, compressedSize int64) {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
 
+	currentTime := formatTimeForDB(time.Now().In(localTZ))
+
 	if isHit {
-		// 	Updating cache record when cache hit
 		_, err := db.Exec(
-			"UPDATE cache SET access_count = access_count + 1, last_access = datetime('now') WHERE url = ?",
-			imageURL,
+			"UPDATE cache SET access_count = access_count + 1, last_access = ? WHERE url = ?",
+			currentTime, imageURL,
 		)
 		if err != nil {
 			log.Printf("Updating cache record failed: %v", err)
 		}
 
-		// 	Updating cache hit statistics
 		_, err = db.Exec("UPDATE stats SET total_cache_hits = total_cache_hits + 1 WHERE id = 1")
 		if err != nil {
 			log.Printf("Updating cache hit statistics failed: %v", err)
 		}
 
-		// 	Updating cache hit statistics
 		if originalSize > 0 && compressedSize > 0 {
 			bytesSaved := originalSize - compressedSize
 			if bytesSaved > 0 {
@@ -247,22 +242,19 @@ func updateCacheRecord(imageURL, filePath, thumbPath, format string, isHit bool,
 			}
 		}
 	} else {
-		// 	Updating cache miss statistics
 		_, err := db.Exec(
-			"INSERT INTO cache (url, file_path, thumb_path, format, access_count, last_access, created_at) VALUES (?, ?, ?, ?, 1, datetime('now'), datetime('now'))",
-			imageURL, filePath, thumbPath, format,
+			"INSERT INTO cache (url, file_path, thumb_path, format, access_count, last_access, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+			imageURL, filePath, thumbPath, format, currentTime, currentTime,
 		)
 		if err != nil {
 			log.Printf("Updating cache miss statistics failed: %v", err)
 		}
 
-		// 	Updating cache miss statistics
 		_, err = db.Exec("UPDATE stats SET total_cache_misses = total_cache_misses + 1 WHERE id = 1")
 		if err != nil {
 			log.Printf("Updating cache miss statistics failed: %v", err)
 		}
 
-		// 	Updating cache miss statistics
 		if originalSize > 0 && compressedSize > 0 {
 			bytesSaved := originalSize - compressedSize
 			if bytesSaved > 0 {
@@ -274,14 +266,12 @@ func updateCacheRecord(imageURL, filePath, thumbPath, format string, isHit bool,
 		}
 	}
 
-	// 	Updating total requests statistics
 	_, err := db.Exec("UPDATE stats SET total_requests = ? WHERE id = 1", atomic.LoadInt64(&requestCount))
 	if err != nil {
 		log.Printf("Updating total requests statistics failed: %v", err)
 	}
 }
 
-// From cache getting image
 func getFromCache(imageURL string) ([]byte, string, bool) {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
@@ -300,11 +290,9 @@ func getFromCache(imageURL string) ([]byte, string, bool) {
 		return nil, "", false
 	}
 
-	// 	Reading cache file
 	imgData, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Printf("Reading cache file failed: %v", err)
-		// 	Deleting cache file
 		if os.IsNotExist(err) {
 			_, _ = db.Exec("DELETE FROM cache WHERE url = ?", imageURL)
 		}
@@ -326,16 +314,13 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 	Checking URL format
 	if !strings.HasPrefix(imageURL, "http://") && !strings.HasPrefix(imageURL, "https://") {
-		// 	Fixing missing colon case, such as https//example.com
 		if strings.HasPrefix(imageURL, "http/") {
 			imageURL = strings.Replace(imageURL, "http/", "http:/", 1)
 		} else if strings.HasPrefix(imageURL, "https/") {
 			imageURL = strings.Replace(imageURL, "https/", "https:/", 1)
 		}
 
-		// 	Fixing URL format
 		if strings.HasPrefix(imageURL, "http:/") && !strings.HasPrefix(imageURL, "http://") {
 			imageURL = strings.Replace(imageURL, "http:/", "http://", 1)
 		} else if strings.HasPrefix(imageURL, "https:/") && !strings.HasPrefix(imageURL, "https://") {
@@ -349,10 +334,8 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 	From cache getting image
 	imgData, format, cacheHit := getFromCache(imageURL)
 
-	// 	Checking cache hit
 	if !cacheHit {
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get(parsedURL.String())
@@ -368,14 +351,12 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 读取原始图片数据
 		rawImgData, err := io.ReadAll(resp.Body)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("读取图片数据失败: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		// 解码图片
 		img, detectedFormat, err := image.Decode(bytes.NewReader(rawImgData))
 		if err != nil {
 			http.Error(w, fmt.Sprintf("图片解码失败: %v", err), http.StatusUnsupportedMediaType)
@@ -385,19 +366,15 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		format = detectedFormat
 		var buf bytes.Buffer
 
-		// 检查是否为动态GIF，如果是则保持原格式，否则转换为静态WebP
 		if format == "gif" {
-			// 检查是否为动态GIF
 			gifImg, err := gif.DecodeAll(bytes.NewReader(rawImgData))
 			if err != nil || len(gifImg.Image) <= 1 {
-				// 静态GIF或解码失败，转为静态WebP
 				format = "webp"
 				if err := nativewebp.Encode(&buf, img, nil); err != nil {
 					http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
 					return
 				}
 			} else {
-				// 动态GIF保持原格式
 				format = "gif"
 				if err := gif.EncodeAll(&buf, gifImg); err != nil {
 					http.Error(w, fmt.Sprintf("GIF 编码失败: %v", err), http.StatusInternalServerError)
@@ -405,7 +382,6 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		} else {
-			// 所有其他格式（PNG、JPEG等）都转换为静态WebP
 			format = "webp"
 			if err := nativewebp.Encode(&buf, img, nil); err != nil {
 				http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
@@ -413,13 +389,11 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 保存到缓存
 		imgData = buf.Bytes()
 		originalSize := int64(len(rawImgData))
 		compressedSize := int64(len(imgData))
 		cachePath := getCacheFilePath(imageURL, format)
 
-		// 生成缩略图
 		thumbPath := ""
 		thumb := generateThumbnail(img, 200, 200)
 		if thumb != nil {
@@ -429,7 +403,7 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 				thumbPath = filepath.Join(cacheDir, "thumbs", thumbFileName)
 				if err := os.WriteFile(thumbPath, thumbBuf.Bytes(), 0644); err != nil {
 					log.Printf("保存缩略图失败: %v", err)
-					thumbPath = "" // 重置为空
+					thumbPath = ""
 				}
 			} else {
 				log.Printf("缩略图编码失败: %v", err)
@@ -438,20 +412,15 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 
 		if err := os.WriteFile(cachePath, imgData, 0644); err != nil {
 			log.Printf("保存缓存失败: %v", err)
-			// 继续处理，即使缓存失败
 		} else {
-			// 更新数据库记录
 			updateCacheRecord(imageURL, cachePath, thumbPath, format, false, originalSize, compressedSize)
 		}
 	} else {
-		// 缓存命中，更新记录
-		// 对于缓存命中，我们假设平均压缩比来估算原始大小
 		compressedSize := int64(len(imgData))
-		estimatedOriginalSize := compressedSize * 3 // 假设平均压缩比为3:1
+		estimatedOriginalSize := compressedSize * 3
 		updateCacheRecord(imageURL, "", "", format, true, estimatedOriginalSize, compressedSize)
 	}
 
-	// 设置适当的Content-Type
 	switch format {
 	case "png":
 		w.Header().Set("Content-Type", "image/png")
@@ -463,7 +432,6 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/jpeg")
 	}
 
-	// 设置缓存控制头
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(imgData)
 	atomic.AddInt64(&requestCount, 1)
@@ -498,89 +466,64 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取缓存大小
-	rows, err := db.Query("SELECT file_path FROM cache")
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var filePath string
-			if err := rows.Scan(&filePath); err != nil {
-				continue
-			}
-			if info, err := os.Stat(filePath); err == nil {
-				cacheSize += info.Size()
-			}
+	err = filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
 		}
+		if !info.IsDir() {
+			cacheSize += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("计算缓存大小失败: %v", err)
 	}
+
+	// 计算缓存命中率
+	var hitRate float64
+	if totalHits+totalMisses > 0 {
+		hitRate = float64(totalHits) / float64(totalHits+totalMisses) * 100
+	}
+
 	dbMutex.Unlock()
 
-	cacheSizeMB := float64(cacheSize) / 1024 / 1024
-	hitRate := 0.0
-	if totalHits+totalMisses > 0 {
-		hitRate = float64(totalHits) * 100 / float64(totalHits+totalMisses)
-	}
-
-	// 计算节省的空间和流量（MB）
-	bytesSavedMB := float64(totalBytesSaved) / 1024 / 1024
-	bandwidthSavedMB := float64(totalBandwidthSaved) / 1024 / 1024
-
-	// 构建 JSON 响应
 	stats := map[string]interface{}{
-		"request_stats": map[string]interface{}{
-			"total_requests": count,
-			"current_time":   time.Now().Format("2006-01-02 15:04:05"),
-		},
-		"cache_stats": map[string]interface{}{
-			"file_count": cacheFiles,
-			"size_mb":    math.Round(cacheSizeMB*100) / 100, // 保留两位小数
-			"hits":       totalHits,
-			"misses":     totalMisses,
-			"hit_rate":   math.Round(hitRate*10) / 10, // 保留一位小数
-		},
-		"savings_stats": map[string]interface{}{
-			"total_space_saved_mb":     math.Round(bytesSavedMB*100) / 100,     // 总节省空间(MB)
-			"total_bandwidth_saved_mb": math.Round(bandwidthSavedMB*100) / 100, // 总节省流量(MB)
-			"compression_efficiency":   "WebP格式平均节省60-80%空间",
-		},
-		"cache_rules": map[string]string{
-			"cache_duration": "10分钟",
-			"note":           "所有缓存文件统一有效期10分钟，从最后一次访问时间开始计算",
-		},
-		"usage": "http://localhost:8080/https://example.com/image.jpg",
+		"total_requests":      count,
+		"total_cache_hits":    totalHits,
+		"total_cache_misses":  totalMisses,
+		"cache_hit_rate":      fmt.Sprintf("%.1f%%", hitRate),
+		"cache_files":         cacheFiles,
+		"cache_size":          cacheSize,
+		"cache_size_mb":       float64(cacheSize) / 1024 / 1024,
+		"total_bytes_saved":   totalBytesSaved,
+		"total_bytes_saved_mb": float64(totalBytesSaved) / 1024 / 1024,
+		"total_bandwidth_saved": totalBandwidthSaved,
+		"total_bandwidth_saved_mb": float64(totalBandwidthSaved) / 1024 / 1024,
+		"current_time":        time.Now().In(localTZ).Format("2006-01-02 15:04:05 MST"),
+		"server_timezone":     localTZ.String(),
 	}
 
-	jsonData, err := json.Marshal(stats)
-	if err != nil {
-		http.Error(w, "生成JSON失败", http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(jsonData)
+	json.NewEncoder(w).Encode(stats)
 }
 
-// 生成缩略图
 func generateThumbnail(img image.Image, maxWidth, maxHeight int) image.Image {
 	bounds := img.Bounds()
 	origWidth := bounds.Dx()
 	origHeight := bounds.Dy()
 
-	// 计算缩放比例
 	scaleX := float64(maxWidth) / float64(origWidth)
 	scaleY := float64(maxHeight) / float64(origHeight)
 	scale := math.Min(scaleX, scaleY)
 
-	// 如果图片已经足够小，直接返回
 	if scale >= 1.0 {
 		return img
 	}
 
-	// 计算新尺寸
 	newWidth := int(float64(origWidth) * scale)
 	newHeight := int(float64(origHeight) * scale)
 
-	// 创建新图片
 	thumbnail := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
 
-	// 简单的最近邻缩放
 	for y := 0; y < newHeight; y++ {
 		for x := 0; x < newWidth; x++ {
 			srcX := int(float64(x) / scale)
@@ -598,38 +541,31 @@ func generateThumbnail(img image.Image, maxWidth, maxHeight int) image.Image {
 	return thumbnail
 }
 
-// 处理缩略图请求
 func handleThumbnail(w http.ResponseWriter, r *http.Request) {
-	// 从URL路径中提取文件名
 	fileName := strings.TrimPrefix(r.URL.Path, "/thumb/")
 	if fileName == "" {
 		http.Error(w, "缺少文件名", http.StatusBadRequest)
 		return
 	}
 
-	// 构建缩略图文件路径
 	thumbPath := filepath.Join(cacheDir, "thumbs", fileName)
 
-	// 检查缩略图文件是否存在
 	if _, err := os.Stat(thumbPath); os.IsNotExist(err) {
 		http.Error(w, "缩略图不存在", http.StatusNotFound)
 		return
 	}
 
-	// 读取并返回缩略图
 	thumbData, err := os.ReadFile(thumbPath)
 	if err != nil {
 		http.Error(w, "读取缩略图失败", http.StatusInternalServerError)
 		return
 	}
 
-	// 设置正确的Content-Type
 	w.Header().Set("Content-Type", "image/webp")
-	w.Header().Set("Cache-Control", "public, max-age=86400") // 缓存1天
+	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(thumbData)
 }
 
-// 缓存列表页面数据结构
 type CacheItem struct {
 	URL         string    `json:"url"`
 	FilePath    string    `json:"file_path"`
@@ -648,15 +584,12 @@ type CacheListResponse struct {
 	TotalPages int         `json:"total_pages"`
 }
 
-// 处理缓存列表请求
 func handleCacheList(w http.ResponseWriter, r *http.Request) {
-	// 解析查询参数
 	pageStr := r.URL.Query().Get("page")
 	pageSizeStr := r.URL.Query().Get("page_size")
 	sortBy := r.URL.Query().Get("sort")
 	format := r.URL.Query().Get("format")
 
-	// 设置默认值
 	page := 1
 	pageSize := 20
 	if pageStr != "" {
@@ -670,14 +603,11 @@ func handleCacheList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 检查是否请求HTML页面
 	if r.Header.Get("Accept") != "" && strings.Contains(r.Header.Get("Accept"), "text/html") {
-		// 返回HTML页面
 		handleCacheListHTML(w, r, page, pageSize, sortBy)
 		return
 	}
 
-	// 构建SQL查询
 	var whereClause string
 	var args []interface{}
 	if format != "" {
@@ -685,7 +615,6 @@ func handleCacheList(w http.ResponseWriter, r *http.Request) {
 		args = append(args, format)
 	}
 
-	// 排序
 	orderBy := "ORDER BY last_access DESC"
 	switch sortBy {
 	case "access_count":
@@ -699,7 +628,6 @@ func handleCacheList(w http.ResponseWriter, r *http.Request) {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
 
-	// 获取总数
 	var total int
 	countQuery := "SELECT COUNT(*) FROM cache"
 	if whereClause != "" {
@@ -714,7 +642,6 @@ func handleCacheList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取分页数据
 	offset := (page - 1) * pageSize
 	var query string
 	if whereClause != "" {
@@ -744,11 +671,10 @@ func handleCacheList(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 解析时间
-		if item.LastAccess, err = time.Parse("2006-01-02 15:04:05", lastAccessStr); err != nil {
+		if item.LastAccess, err = parseDBTime(lastAccessStr); err != nil {
 			log.Printf("解析最后访问时间失败: %v", err)
 		}
-		if item.CreatedAt, err = time.Parse("2006-01-02 15:04:05", createdAtStr); err != nil {
+		if item.CreatedAt, err = parseDBTime(createdAtStr); err != nil {
 			log.Printf("解析创建时间失败: %v", err)
 		}
 
@@ -774,7 +700,6 @@ func handleCacheList(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 处理缓存列表HTML页面
 func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize int, sortBy string) {
 	htmlTemplate := `
 <!DOCTYPE html>
@@ -986,12 +911,11 @@ func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize 
         let currentSort = '{{.Sort}}';
         let currentFormat = '';
         
-        // 设置初始值
         document.getElementById('sortSelect').value = currentSort;
         document.getElementById('pageSizeInput').value = currentPageSize;
         
         function updateList() {
-            currentPage = 1; // 重置到第一页
+            currentPage = 1;
             currentSort = document.getElementById('sortSelect').value;
             currentFormat = document.getElementById('formatSelect').value;
             currentPageSize = parseInt(document.getElementById('pageSizeInput').value) || 20;
@@ -1083,12 +1007,10 @@ func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize 
             
             let html = '';
             
-            // 上一页
             if (data.page > 1) {
                 html += '<a href="#" onclick="goToPage(' + (data.page - 1) + ')">« 上一页</a>';
             }
             
-            // 页码
             const startPage = Math.max(1, data.page - 2);
             const endPage = Math.min(data.total_pages, data.page + 2);
             
@@ -1114,7 +1036,6 @@ func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize 
                 html += '<a href="#" onclick="goToPage(' + data.total_pages + ')">' + data.total_pages + '</a>';
             }
             
-            // 下一页
             if (data.page < data.total_pages) {
                 html += '<a href="#" onclick="goToPage(' + (data.page + 1) + ')">下一页 »</a>';
             }
@@ -1130,7 +1051,6 @@ func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize 
                 '📦 每页显示 <strong>' + data.page_size + '</strong> 个';
         }
         
-        // 页面加载时获取数据
         document.addEventListener('DOMContentLoaded', function() {
             loadCacheList();
         });
@@ -1139,14 +1059,12 @@ func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize 
 </html>
 `
 
-	// 解析模板
 	tmpl, err := template.New("cache").Parse(htmlTemplate)
 	if err != nil {
 		http.Error(w, "模板解析失败", http.StatusInternalServerError)
 		return
 	}
 
-	// 渲染模板
 	data := struct {
 		Page     int
 		PageSize int
@@ -1159,4 +1077,17 @@ func handleCacheListHTML(w http.ResponseWriter, r *http.Request, page, pageSize 
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.Execute(w, data)
+}
+
+func formatTimeForDB(t time.Time) string {
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func parseDBTime(timeStr string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02 15:04:05", timeStr)
+	if err != nil {
+		return time.Time{}, err
+	}
+	
+	return t.UTC().In(localTZ), nil
 }
