@@ -24,3 +24,18 @@ go.work.sum
 # env file
 .env
 /.trae
+/logs
+CLAUDE.md
+imgproxy.db
+imgproxy.db-shm
+imgproxy.db-wal
+/cache
+.pass
+webpimg
+webpimg.log
+test_cleanup
+test_webpimg.go
+test_webpimg
+test_cleanup.go
+test_cache.go
+test_cache
