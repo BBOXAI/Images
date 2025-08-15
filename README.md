@@ -54,8 +54,8 @@ irm https://raw.githubusercontent.com/BBOXAI/Images/main/install.ps1 | iex
    Linux/macOS:
    ```bash
    tar -xzf webpimg-linux-amd64.tar.gz
-   chmod +x webpimg
-   ./webpimg
+   chmod +x webpimg-linux-amd64
+   ./webpimg-linux-amd64
    ```
    
    Windows:
@@ -223,8 +223,8 @@ The installation script will automatically:
    Linux/macOS:
    ```bash
    tar -xzf webpimg-linux-amd64.tar.gz
-   chmod +x webpimg
-   ./webpimg
+   chmod +x webpimg-linux-amd64
+   ./webpimg-linux-amd64
    ```
    
    Windows:

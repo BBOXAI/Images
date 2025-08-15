@@ -113,9 +113,14 @@ function Install-WebPImageProxy {
         }
         
         # 复制文件
-        $exePath = Join-Path $tempDir "webpimg.exe"
+        # 优先查找带平台信息的文件名
+        $exePath = Join-Path $tempDir "webpimg-windows-$Arch.exe"
         if (!(Test-Path $exePath)) {
-            # 尝试查找 exe 文件
+            # 尝试不带平台信息的文件名
+            $exePath = Join-Path $tempDir "webpimg.exe"
+        }
+        if (!(Test-Path $exePath)) {
+            # 最后尝试查找任何 exe 文件
             $exePath = Get-ChildItem -Path $tempDir -Filter "*.exe" -Recurse | Select-Object -First 1 | % { $_.FullName }
         }
         

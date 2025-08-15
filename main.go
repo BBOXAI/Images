@@ -1462,8 +1462,19 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/favicon.ico" {
 			// 如果是根路径，显示使用说明
 			if r.URL.Path == "/" && imageURL == "" {
+				// 获取当前访问的主机名
+				scheme := "http"
+				if r.TLS != nil {
+					scheme = "https"
+				}
+				host := r.Host
+				if host == "" {
+					host = "localhost:8080"
+				}
+				baseURL := fmt.Sprintf("%s://%s", scheme, host)
+				
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				helpHTML := `
+				helpHTML := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
 <head>
@@ -1481,73 +1492,73 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
     
     <div class="example">
         <h3>1. 查询参数方式（推荐，保留双斜杠）：</h3>
-        <pre>http://localhost:8080/?url=https://example.com//path//to//image.jpg</pre>
+        <pre>%s/?url=https://example.com//path//to//image.jpg</pre>
     </div>
     
     <div class="example">
         <h3>2. 编码路径方式（用 _DS_ 代表 //）：</h3>
-        <pre>http://localhost:8080/https:_DS_example.com_DS_path_DS_to_DS_image.jpg</pre>
+        <pre>%s/https:_DS_example.com_DS_path_DS_to_DS_image.jpg</pre>
     </div>
     
     <div class="example">
         <h3>3. 标准路径方式：</h3>
-        <pre>http://localhost:8080/https://example.com/path/to/image.jpg</pre>
+        <pre>%s/https://example.com/path/to/image.jpg</pre>
     </div>
     
     <h2>格式转换：</h2>
     <div class="example">
         <h3>强制转换为 WebP（默认行为）：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.png&format=webp</pre>
+        <pre>%s/?url=https://example.com/image.png&format=webp</pre>
     </div>
     
     <div class="example">
         <h3>保持原始格式：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.png&format=original</pre>
+        <pre>%s/?url=https://example.com/image.png&format=original</pre>
     </div>
     
     <h2>图片尺寸调整：</h2>
     <div class="example">
         <h3>指定宽度（高度自动按比例）：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=500</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=500</pre>
     </div>
     
     <div class="example">
         <h3>指定高度（宽度自动按比例）：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&h=300</pre>
+        <pre>%s/?url=https://example.com/image.jpg&h=300</pre>
     </div>
     
     <div class="example">
         <h3>指定宽度和高度（保持纵横比，适应框内）：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=500&h=300</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300</pre>
     </div>
     
     <div class="example">
         <h3>组合参数（缩放 + 格式 + 质量）：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=800&format=webp&q=90</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=800&format=webp&q=90</pre>
     </div>
     
     <h2>缩放模式（mode 参数）：</h2>
     <div class="example">
         <h3>fit（默认）- 适应框内，保持纵横比：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=500&h=300&mode=fit</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=fit</pre>
         <p>图片完全显示在指定尺寸内，可能有空白区域</p>
     </div>
     
     <div class="example">
         <h3>fill - 填充整个框，裁剪多余部分：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=500&h=300&mode=fill</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=fill</pre>
         <p>图片填满整个框，可能裁剪掉部分内容</p>
     </div>
     
     <div class="example">
         <h3>stretch - 拉伸到精确尺寸：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=500&h=300&mode=stretch</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=stretch</pre>
         <p>强制拉伸到指定尺寸，可能导致图片变形</p>
     </div>
     
     <div class="example">
         <h3>pad - 适应框内并添加白色边距：</h3>
-        <pre>http://localhost:8080/?url=https://example.com/image.jpg&w=500&h=300&mode=pad</pre>
+        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=pad</pre>
         <p>保持纵横比，用白色填充空白区域</p>
     </div>
     
@@ -1557,7 +1568,7 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
         <li><a href="/stats">统计信息（JSON）</a></li>
     </ul>
 </body>
-</html>`
+</html>`, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL)
 				w.Write([]byte(helpHTML))
 				return
 			}
@@ -2027,6 +2038,17 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		memCacheMutex.RUnlock()
 	}
 	
+	// 获取当前访问的主机名
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	host := r.Host
+	if host == "" {
+		host = "localhost:8080"
+	}
+	baseURL := fmt.Sprintf("%s://%s", scheme, host)
+	
 	// 构建 JSON 响应
 	stats := map[string]interface{}{
 		"request_stats": map[string]interface{}{
@@ -2058,7 +2080,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			"cache_duration": "10分钟",
 			"note":           "所有缓存文件统一有效期10分钟，从最后一次访问时间开始计算",
 		},
-		"usage": "http://localhost:8080/https://example.com/image.jpg",
+		"usage": fmt.Sprintf("%s/https://example.com/image.jpg", baseURL),
 	}
 
 	jsonData, err := json.Marshal(stats)
