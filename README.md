@@ -1,158 +1,400 @@
-# WebP Image Proxy / WebP图片代理
+# WebP Image Proxy Service
 
-This is a Go program that acts as an online image proxy and converter. It fetches images from a given URL, converts them to WebP format, and serves them with intelligent caching and database storage.
+一个高性能的图片代理服务，自动将远程图片转换为WebP格式并提供缓存功能。
 
-这是一个Go程序，作为在线图片代理和转换器。它从给定的URL获取图片，转换为WebP格式，并提供智能缓存和数据库存储服务。
+[English](#english) | [中文](#中文)
 
-## Features / 功能特性
+## 中文
 
-- **Image Proxy & Conversion / 图片代理与转换**: Fetch images from remote URLs and convert them in real-time / 从远程URL获取图片并实时转换
-- **WebP Format Support / WebP格式支持**: Uses pure Go native library `github.com/HugoSmits86/nativewebp` for WebP encoding / 使用纯Go原生库 `github.com/HugoSmits86/nativewebp` 进行WebP编码
-- **Smart Format Processing / 智能格式处理**: 
-  - Static images (PNG, JPEG) → WebP format / 静态图片 (PNG, JPEG) → WebP格式
-  - Animated GIF → Keep GIF format / 动态GIF → 保持GIF格式
-- **High-Performance Caching / 高性能缓存**: Local file cache + SQLite database storage / 本地文件缓存 + SQLite数据库存储
-- **Statistics / 统计功能**: Request count, cache hit rate, space and traffic savings statistics / 请求计数、缓存命中率、节省空间和流量统计
-- **Cache Management / 缓存管理**: Visual cache list with sorting, filtering, and pagination / 可视化缓存列表，支持排序、筛选、分页浏览
-- **Thumbnail Generation / 缩略图生成**: Automatically generate 200x200 pixel WebP thumbnails for preview / 自动生成200x200像素WebP缩略图用于预览
-- **Pure Go Implementation / 纯Go实现**: No CGO dependencies, uses `modernc.org/sqlite` pure Go SQLite driver / 无CGO依赖，使用 `modernc.org/sqlite` 纯Go SQLite驱动
-- **Automatic Cache Management / 自动缓存管理**: Supports cache size limits and automatic cleanup / 支持缓存大小限制和自动清理
+### 功能特性
 
-## Tech Stack / 技术栈
+- 🚀 自动将图片转换为WebP格式，大幅减小文件体积
+- 💾 智能缓存系统，支持内存缓存和磁盘缓存
+- 📊 实时统计和可视化管理界面
+- 🔒 密码保护的管理后台
+- 🌐 中英双语支持
+- 📱 响应式界面设计
+- ⚡ 高并发支持，内存缓存可减少数据库压力
+- 🎨 支持图片缩放和多种调整模式
 
-- **Go 1.24.4**: Main programming language / 主要编程语言
-- **github.com/HugoSmits86/nativewebp v0.9.3**: Pure Go WebP encoding library / 纯Go WebP编码库
-- **modernc.org/sqlite v1.38.0**: Pure Go SQLite database driver / 纯Go SQLite数据库驱动
-- **Standard Library / 标准库**: `image/png`, `image/gif`, `image/jpeg` for image decoding / 用于图片解码
+### 快速部署
 
-## Installation & Usage / 安装与使用
+#### 🚀 一键安装（推荐）
 
-### 1. Install Dependencies / 安装依赖
+**Linux/macOS:**
 ```bash
-go mod tidy
+curl -fsSL https://raw.githubusercontent.com/BBOXAI/Images/main/install.sh | sudo bash
 ```
 
-### 2. Build Program / 构建程序
+**Windows (PowerShell 管理员模式):**
+```powershell
+irm https://raw.githubusercontent.com/BBOXAI/Images/main/install.ps1 | iex
+```
+
+安装脚本会自动：
+- ✅ 检测系统架构并下载对应版本
+- ✅ 创建系统服务并设置开机自启
+- ✅ 生成管理密码和配置文件
+- ✅ 配置防火墙规则
+- ✅ 启动服务
+
+#### 手动安装
+
+1. **下载最新版本**
+
+   访问 [Releases](https://github.com/BBOXAI/Images/releases) 页面下载适合你系统的版本：
+   
+   支持的平台：
+   - Linux: `amd64`, `arm64`, `armv7`
+   - Windows: `amd64`, `arm64`
+   - macOS: `amd64`, `arm64`
+
+2. **解压并运行**
+
+   Linux/macOS:
+   ```bash
+   tar -xzf webpimg-linux-amd64.tar.gz
+   chmod +x webpimg
+   ./webpimg
+   ```
+   
+   Windows:
+   ```cmd
+   # 解压 zip 文件后运行
+   webpimg.exe
+   ```
+
+3. **访问服务**
+
+   - 图片代理: `http://localhost:8080/[图片URL]`
+   - 管理界面: `http://localhost:8080/cache`
+   - 统计信息: `http://localhost:8080/stats`
+
+#### 服务管理
+
+**Linux (systemd):**
 ```bash
-go build -o webp_proxy main.go
+sudo systemctl status webpimg   # 查看状态
+sudo systemctl stop webpimg     # 停止服务
+sudo systemctl start webpimg    # 启动服务
+sudo systemctl restart webpimg  # 重启服务
+sudo journalctl -u webpimg -f   # 查看日志
 ```
 
-### 3. Run Program / 运行程序
+**Windows:**
+```powershell
+Get-Service WebPImageProxy       # 查看状态
+Stop-Service WebPImageProxy      # 停止服务
+Start-Service WebPImageProxy     # 启动服务
+Restart-Service WebPImageProxy   # 重启服务
+```
+
+#### 卸载
+
 ```bash
-./webp_proxy
-```
-Default server starts at `http://localhost:8080` / 默认服务器启动在 `http://localhost:8080`
+# Linux/macOS
+sudo bash install.sh uninstall
 
-### 4. Use Proxy / 使用代理
-
-**Image conversion URL format / 图片转换URL格式:**
-```
-http://your-domain.com/<image_url>
+# Windows (PowerShell 管理员模式)
+.\install.ps1 uninstall
 ```
 
-**Example / 示例:**
-```
-http://localhost:8080/https://example.com/image.png
-```
+#### 更新
 
-### 5. View Statistics / 查看统计
+```bash
+# Linux/macOS
+sudo bash install.sh update
 
-Access statistics page / 访问统计页面:
-```
-http://localhost:8080/stats
+# Windows (PowerShell 管理员模式)
+.\install.ps1 update
 ```
 
-**Statistics include / 统计信息包括:**
-- Total requests and current time / 总请求数和当前时间
-- Cache file count, size, hit rate / 缓存文件数量、大小、命中率
-- **Total space saved / 总节省空间**: Storage space saved through WebP compression / 通过WebP压缩节省的存储空间
-- **Total traffic saved / 总节省流量**: Network transmission reduced through compression / 通过压缩减少的网络传输量
-- Cache rules and usage instructions / 缓存规则和使用说明
+### 配置说明
 
-### 6. Cache Management / 缓存管理
+#### 密码设置
 
-Access cache management page / 访问缓存管理页面:
-```
-http://localhost:8080/cache
+服务首次启动时会自动生成8位随机密码并保存到 `.pass` 文件。你也可以手动创建：
+
+```bash
+echo "your-password" > .pass
 ```
 
-**Cache management features / 缓存管理功能:**
-- 📋 **List Display / 列表展示**: View all cached image files / 查看所有缓存的图片文件
-- 🖼️ **Thumbnail Preview / 缩略图预览**: Auto-generate 200x200 pixel WebP thumbnails / 自动生成200x200像素的WebP缩略图
-- 📊 **Sorting / 排序功能**: Sort by access count, last access time, creation time, URL / 支持按访问次数、最后访问时间、创建时间、URL排序
-- 🔍 **Format Filtering / 格式筛选**: Filter by image format (WebP, GIF, PNG, JPEG) / 按图片格式（WebP、GIF、PNG、JPEG）筛选
-- 📄 **Pagination / 分页浏览**: Custom items per page (1-100) / 支持自定义每页显示数量（1-100个）
-- 📱 **Responsive Design / 响应式设计**: Adapts to desktop and mobile devices / 适配桌面和移动设备
+#### 配置文件
 
-## Output Format / 输出格式
+服务会自动生成 `config.json` 配置文件，可通过管理界面修改或直接编辑：
 
-| Input Format / 输入格式 | Output Format / 输出格式 | Description / 说明 |
-|---------|---------|------|
-| PNG | WebP | Static image converted to WebP / 静态图片转换为WebP |
-| JPEG | WebP | Static image converted to WebP / 静态图片转换为WebP |
-| Static GIF / 静态GIF | WebP | Single-frame GIF converted to WebP / 单帧GIF转换为WebP |
-| Animated GIF / 动态GIF | GIF | Keep original format to support animation / 保持原格式以支持动画 |
-
-## Cache Mechanism / 缓存机制
-
-- **Local File Cache / 本地文件缓存**: Converted images stored in `cache/` directory / 转换后的图片存储在 `cache/` 目录
-- **SQLite Database / SQLite数据库**: Store cache metadata and statistics / 存储缓存元数据和统计信息
-- **Cache Key / 缓存键**: MD5 hash based on original URL / 基于原始URL的MD5哈希
-- **Cache Validity / 缓存有效期**: Unified 10-minute validity period from last access time / 统一10分钟有效期，从最后访问时间开始计算
-- **Auto Cleanup / 自动清理**: Periodically clean expired cache files and database records / 定期清理过期缓存文件和数据库记录
-
-## Deployment Recommendations / 部署建议
-
-It is recommended to use a reverse proxy (such as Nginx) in production environments to handle SSL termination and domain mapping.
-
-建议在生产环境中使用反向代理（如Nginx）来处理SSL终止和域名映射。
-
-**Nginx Configuration Example / Nginx配置示例:**
-
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;
-    
-    location / {
-        proxy_pass http://localhost:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # Increase timeout for handling large images / 增加超时时间以处理大图片
-        proxy_read_timeout 60s;
-        proxy_connect_timeout 60s;
-    }
+```json
+{
+  "max_mem_cache_entries": 500,      // 内存缓存最大条目数
+  "max_mem_cache_size_mb": 30,       // 内存缓存最大大小(MB)
+  "max_disk_cache_size_mb": 200,     // 磁盘缓存最大大小(MB)
+  "cleanup_interval_min": 10,        // 清理间隔(分钟)
+  "access_window_min": 60,           // 访问时间窗口(分钟)
+  "sync_interval_sec": 60,           // 数据库同步间隔(秒)
+  "cache_validity_min": 15           // 缓存有效期(分钟)
 }
 ```
 
-## Performance Features / 性能特点
+### 使用方法
 
-- **Pure Go Implementation / 纯Go实现**: No CGO dependencies, simple deployment / 无CGO依赖，部署简单
-- **Efficient Caching / 高效缓存**: Avoid duplicate conversions, improve response speed / 避免重复转换，提升响应速度
-- **Memory Optimization / 内存优化**: Stream processing for large images, control memory usage / 流式处理大图片，控制内存使用
-- **Concurrency Safe / 并发安全**: Support multiple concurrent request processing / 支持多并发请求处理
+#### 基本使用
 
-## Notes / 注意事项
+```
+http://localhost:8080/https://example.com/image.jpg
+```
 
-1. **Network Dependency / 网络依赖**: First access requires downloading images from source / 首次访问需要从源站下载图片
-2. **Storage Space / 存储空间**: Cache will occupy local disk space / 缓存会占用本地磁盘空间
-3. **Animated GIF / 动态GIF**: To maintain animation effects, animated GIFs keep original format / 为保持动画效果，动态GIF保持原格式
-4. **Error Handling / 错误处理**: Returns 404 error when source image is inaccessible / 源图片无法访问时返回404错误
+#### 参数支持
 
-## Development Status / 开发状态
+- **格式转换**: `?format=webp` 或 `?format=original`
+- **尺寸调整**: `?w=300&h=200`
+- **质量设置**: `?q=85` (1-100)
+- **调整模式**: `?mode=fit|fill|stretch|pad`
+  - `fit`: 保持比例，缩放到指定范围内
+  - `fill`: 保持比例，填充整个区域（可能裁剪）
+  - `stretch`: 拉伸图片到指定尺寸
+  - `pad`: 保持比例，用白色填充空白区域
 
-Current version implemented / 当前版本已实现:
-- ✅ Static image WebP conversion / 静态图片WebP转换
-- ✅ Animated GIF format preservation / 动态GIF格式保持
-- ✅ SQLite cache system / SQLite缓存系统
-- ✅ Statistics (request count, hit rate, space savings) / 统计功能（请求数、命中率、节省空间统计）
-- ✅ Cache management page (list, sort, filter, pagination) / 缓存管理页面（列表、排序、筛选、分页）
-- ✅ Automatic thumbnail generation and preview / 缩略图自动生成和预览
-- ❌ Animated GIF to WebP animation (temporarily removed due to library compatibility issues) / 动态GIF转WebP动画（因库兼容性问题暂时移除）
+#### 示例
 
-## License / 许可证
+```
+# 转换为WebP并调整为300x200
+http://localhost:8080/https://example.com/image.jpg?format=webp&w=300&h=200
+
+# 保持原格式，质量85%
+http://localhost:8080/https://example.com/image.jpg?format=original&q=85
+
+# 使用填充模式调整尺寸
+http://localhost:8080/https://example.com/image.jpg?w=400&h=300&mode=fill
+```
+
+### 从源码编译
+
+如需自行编译，请参考 [BUILDING.md](BUILDING.md) 文档。
+
+---
+
+## English
+
+### Features
+
+- 🚀 Automatically converts images to WebP format, significantly reducing file size
+- 💾 Smart caching system with memory and disk cache support
+- 📊 Real-time statistics and visual management interface
+- 🔒 Password-protected admin panel
+- 🌐 Bilingual support (Chinese/English)
+- 📱 Responsive interface design
+- ⚡ High concurrency support with memory cache to reduce database load
+- 🎨 Image resizing with multiple adjustment modes
+
+### Quick Deployment
+
+#### 🚀 One-Click Installation (Recommended)
+
+**Linux/macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/BBOXAI/Images/main/install.sh | sudo bash
+```
+
+**Windows (PowerShell as Administrator):**
+```powershell
+irm https://raw.githubusercontent.com/BBOXAI/Images/main/install.ps1 | iex
+```
+
+The installation script will automatically:
+- ✅ Detect system architecture and download the appropriate version
+- ✅ Create system service with auto-start on boot
+- ✅ Generate admin password and configuration files
+- ✅ Configure firewall rules
+- ✅ Start the service
+
+#### Manual Installation
+
+1. **Download Latest Release**
+
+   Visit [Releases](https://github.com/BBOXAI/Images/releases) page to download the version for your system:
+   
+   Supported platforms:
+   - Linux: `amd64`, `arm64`, `armv7`
+   - Windows: `amd64`, `arm64`
+   - macOS: `amd64`, `arm64`
+
+2. **Extract and Run**
+
+   Linux/macOS:
+   ```bash
+   tar -xzf webpimg-linux-amd64.tar.gz
+   chmod +x webpimg
+   ./webpimg
+   ```
+   
+   Windows:
+   ```cmd
+   # Extract zip file and run
+   webpimg.exe
+   ```
+
+3. **Access Service**
+
+   - Image Proxy: `http://localhost:8080/[image-url]`
+   - Admin Panel: `http://localhost:8080/cache`
+   - Statistics: `http://localhost:8080/stats`
+
+#### Service Management
+
+**Linux (systemd):**
+```bash
+sudo systemctl status webpimg   # Check status
+sudo systemctl stop webpimg     # Stop service
+sudo systemctl start webpimg    # Start service
+sudo systemctl restart webpimg  # Restart service
+sudo journalctl -u webpimg -f   # View logs
+```
+
+**Windows:**
+```powershell
+Get-Service WebPImageProxy       # Check status
+Stop-Service WebPImageProxy      # Stop service
+Start-Service WebPImageProxy     # Start service
+Restart-Service WebPImageProxy   # Restart service
+```
+
+#### Uninstall
+
+```bash
+# Linux/macOS
+sudo bash install.sh uninstall
+
+# Windows (PowerShell as Administrator)
+.\install.ps1 uninstall
+```
+
+#### Update
+
+```bash
+# Linux/macOS
+sudo bash install.sh update
+
+# Windows (PowerShell as Administrator)
+.\install.ps1 update
+```
+
+### Configuration
+
+#### Password Setup
+
+The service automatically generates an 8-character random password on first startup and saves it to `.pass` file. You can also create it manually:
+
+```bash
+echo "your-password" > .pass
+```
+
+#### Configuration File
+
+The service automatically generates a `config.json` file, which can be modified through the admin interface or edited directly:
+
+```json
+{
+  "max_mem_cache_entries": 500,      // Maximum memory cache entries
+  "max_mem_cache_size_mb": 30,       // Maximum memory cache size (MB)
+  "max_disk_cache_size_mb": 200,     // Maximum disk cache size (MB)
+  "cleanup_interval_min": 10,        // Cleanup interval (minutes)
+  "access_window_min": 60,           // Access time window (minutes)
+  "sync_interval_sec": 60,           // Database sync interval (seconds)
+  "cache_validity_min": 15           // Cache validity period (minutes)
+}
+```
+
+### Usage
+
+#### Basic Usage
+
+```
+http://localhost:8080/https://example.com/image.jpg
+```
+
+#### Parameters
+
+- **Format Conversion**: `?format=webp` or `?format=original`
+- **Size Adjustment**: `?w=300&h=200`
+- **Quality Setting**: `?q=85` (1-100)
+- **Adjustment Mode**: `?mode=fit|fill|stretch|pad`
+  - `fit`: Maintain aspect ratio, scale within specified bounds
+  - `fill`: Maintain aspect ratio, fill entire area (may crop)
+  - `stretch`: Stretch image to specified dimensions
+  - `pad`: Maintain aspect ratio, fill blank areas with white
+
+#### Examples
+
+```
+# Convert to WebP and resize to 300x200
+http://localhost:8080/https://example.com/image.jpg?format=webp&w=300&h=200
+
+# Keep original format, 85% quality
+http://localhost:8080/https://example.com/image.jpg?format=original&q=85
+
+# Resize with fill mode
+http://localhost:8080/https://example.com/image.jpg?w=400&h=300&mode=fill
+```
+
+### Building from Source
+
+For building from source code, please refer to [BUILDING.md](BUILDING.md).
+
+---
+
+## API Reference
+
+### Statistics
+
+```bash
+GET /stats
+```
+
+Returns JSON statistics data:
+- Request statistics
+- Cache hit rate
+- Space savings statistics
+- Format distribution
+
+### Cache Management
+
+```bash
+GET /cache                 # Admin interface
+GET /cache?page=1&page_size=20  # Paginated data
+POST /cache/control?action=toggle  # Toggle memory cache
+POST /cache/control?action=sync    # Sync to database immediately
+```
+
+## System Requirements
+
+- **Port**: Default port 8080 (auto-tries 8081-8100 if occupied)
+- **Disk Space**: Recommend at least 500MB for cache storage
+- **Memory**: Recommend at least 256MB RAM
+
+## Troubleshooting
+
+### Port Already in Use
+
+The service automatically tries ports 8080-8100. The startup log shows the actual port being used.
+
+### Cache Cleanup
+
+Cache files are automatically cleaned based on configured validity period. You can also manually delete files in the `cache/` directory.
+
+### Database Lock
+
+If you encounter database lock issues, delete `imgproxy.db-wal` and `imgproxy.db-shm` files and restart the service.
+
+## License
 
 MIT License
+
+## Contributing
+
+Issues and Pull Requests are welcome!
+
+## Links
+
+- [GitHub Repository](https://github.com/BBOXAI/Images)
+- [Issue Tracker](https://github.com/BBOXAI/Images/issues)
+- [Releases](https://github.com/BBOXAI/Images/releases)
