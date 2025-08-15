@@ -328,8 +328,8 @@ func main() {
 		listener, err = net.Listen("tcp", addr)
 		if err == nil {
 			// 端口可用
-			fmt.Printf("Server started on http://localhost:%d\n", port)
-			fmt.Printf("Cache management: http://localhost:%d/cache\n", port)
+			fmt.Printf("Server started on http://0.0.0.0:%d\n", port)
+			fmt.Printf("Cache management: http://0.0.0.0:%d/cache\n", port)
 			break
 		}
 		// 端口被占用，尝试下一个
