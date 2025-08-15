@@ -151,7 +151,8 @@ download_and_install() {
     mkdir -p "$INSTALL_DIR"
     
     # 复制文件
-    cp webpimg "$INSTALL_DIR/"
+    # 解压后的文件名包含平台信息
+    cp webpimg-${PLATFORM} "$INSTALL_DIR/webpimg"
     chmod +x "$INSTALL_DIR/webpimg"
     
     # 清理临时文件
