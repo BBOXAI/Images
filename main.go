@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -22,7 +24,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +45,20 @@ type CacheEntry struct {
 	LastAccess  time.Time
 	CreatedAt   time.Time
 	Dirty       bool // 标记是否需要写入数据库
+	Size        int64 // 缓存文件大小
+	prev        *CacheEntry // LRU链表前向指针
+	next        *CacheEntry // LRU链表后向指针
+}
+
+// LRUCache LRU缓存管理器
+type LRUCache struct {
+	mu          sync.RWMutex
+	entries     map[string]*CacheEntry
+	head        *CacheEntry // 最近使用的
+	tail        *CacheEntry // 最久未使用的
+	maxEntries  int
+	maxSizeMB   int
+	currentSize int64
 }
 
 // CacheConfig 缓存配置
@@ -137,6 +152,33 @@ var languages = map[string]*Language{
 			"msg_deleted": "已删除",
 			"msg_login_failed": "密码错误，请重试",
 			"msg_no_data": "暂无数据",
+			
+			// 首页翻译
+			"service_title": "图片代理服务",
+			"usage_title": "使用方法：",
+			"query_param_method": "查询参数方式（推荐，保留双斜杠）：",
+			"encoded_path_method": "编码路径方式（用 _DS_ 代表 //）：",
+			"standard_path_method": "标准路径方式：",
+			"format_conversion_title": "格式转换：",
+			"force_webp_conversion": "强制转换为 WebP（默认行为）：",
+			"keep_original_format": "保持原始格式：",
+			"image_resize_title": "图片尺寸调整：",
+			"specify_width": "指定宽度（高度自动按比例）：",
+			"specify_height": "指定高度（宽度自动按比例）：",
+			"specify_both_dimensions": "指定宽度和高度（保持纵横比，适应框内）：",
+			"combined_params": "组合参数（缩放 + 格式 + 质量）：",
+			"resize_mode_title": "缩放模式（mode 参数）：",
+			"mode_fit_default": "（默认）- 适应框内，保持纵横比：",
+			"mode_fit_desc": "图片完全显示在指定尺寸内，可能有空白区域",
+			"mode_fill": "填充整个框，裁剪多余部分：",
+			"mode_fill_desc": "图片填满整个框，可能裁剪掉部分内容",
+			"mode_stretch": "拉伸到精确尺寸：",
+			"mode_stretch_desc": "强制拉伸到指定尺寸，可能导致图片变形",
+			"mode_pad": "适应框内并添加白色边距：",
+			"mode_pad_desc": "保持纵横比，用白色填充空白区域",
+			"management_pages_title": "管理页面：",
+			"cache_management": "缓存管理",
+			"statistics_json": "统计信息（JSON）",
 		},
 	},
 	"en": {
@@ -210,6 +252,33 @@ var languages = map[string]*Language{
 			"msg_deleted": "Deleted",
 			"msg_login_failed": "Wrong password, please try again",
 			"msg_no_data": "No data",
+			
+			// Homepage translations
+			"service_title": "Image Proxy Service",
+			"usage_title": "Usage:",
+			"query_param_method": "Query parameter method (recommended, preserves double slashes):",
+			"encoded_path_method": "Encoded path method (use _DS_ for //):",
+			"standard_path_method": "Standard path method:",
+			"format_conversion_title": "Format Conversion:",
+			"force_webp_conversion": "Force WebP conversion (default behavior):",
+			"keep_original_format": "Keep original format:",
+			"image_resize_title": "Image Resizing:",
+			"specify_width": "Specify width (height auto-scales):",
+			"specify_height": "Specify height (width auto-scales):",
+			"specify_both_dimensions": "Specify both width and height (maintains aspect ratio):",
+			"combined_params": "Combined parameters (resize + format + quality):",
+			"resize_mode_title": "Resize Modes (mode parameter):",
+			"mode_fit_default": "(default) - Fit within bounds, maintain aspect ratio:",
+			"mode_fit_desc": "Image fully displayed within specified dimensions, may have blank areas",
+			"mode_fill": "Fill entire frame, crop excess:",
+			"mode_fill_desc": "Image fills entire frame, may crop some content",
+			"mode_stretch": "Stretch to exact dimensions:",
+			"mode_stretch_desc": "Force stretch to specified dimensions, may distort image",
+			"mode_pad": "Fit within bounds with white padding:",
+			"mode_pad_desc": "Maintain aspect ratio, fill blank areas with white",
+			"management_pages_title": "Management Pages:",
+			"cache_management": "Cache Management",
+			"statistics_json": "Statistics (JSON)",
 		},
 	},
 }
@@ -227,13 +296,14 @@ var (
 	logMutex     sync.Mutex
 	logSize      int64
 	maxLogSize   = int64(10 * 1024 * 1024) // 10MB per log file
+	httpServer   *http.Server              // HTTP服务器引用，用于优雅关闭
+	shutdownChan = make(chan struct{})     // 关闭信号通道
 	
 	// 内存缓存相关
-	memCache        map[string]*CacheEntry
-	memCacheMutex   sync.RWMutex
-	useMemCache     bool = true // 默认启用内存缓存
-	lastDBSync      time.Time   // 上次数据库同步时间
-	adminPassword   string      // 管理员密码
+	lruCache      *LRUCache  // LRU缓存管理器
+	useMemCache   bool = true // 默认启用内存缓存
+	lastDBSync      time.Time    // 上次数据库同步时间
+	adminPassword   string       // 管理员密码
 	
 	// 内存缓存池配置
 	cacheConfig = &CacheConfig{
@@ -248,6 +318,23 @@ var (
 	cleanupStopChan    = make(chan bool)   // 用于停止清理协程的通道
 	syncStopChan       = make(chan bool)   // 用于停止同步协程的通道
 	currentLang        = "zh"               // 默认语言
+	startTime          = time.Now()         // 服务启动时间
+	
+	// 缓冲池，用于复用内存
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			// 创建 32KB 的缓冲区
+			return make([]byte, 32*1024)
+		},
+	}
+	
+	// 大缓冲池，用于图片数据
+	largeBufferPool = sync.Pool{
+		New: func() interface{} {
+			// 创建 1MB 的缓冲区用于图片
+			return &bytes.Buffer{}
+		},
+	}
 )
 
 // getLang 根据请求获取语言设置
@@ -291,8 +378,8 @@ func main() {
 	// 加载缓存配置
 	loadCacheConfig()
 	
-	// 初始化内存缓存
-	memCache = make(map[string]*CacheEntry)
+	// 初始化LRU缓存
+	lruCache = NewLRUCache(cacheConfig.MaxMemCacheEntries, cacheConfig.MaxMemCacheSizeMB)
 
 	initDB()
 	
@@ -310,6 +397,7 @@ func main() {
 
 	go cleanExpiredCache()
 
+	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/stats", handleStats)
 	http.HandleFunc("/cache/control", handleCacheControl)
 	http.HandleFunc("/cache", handleCacheList)
@@ -341,8 +429,18 @@ func main() {
 		log.Fatalf("No available port found between 8080 and %d", maxPort)
 	}
 	
+	// 创建 HTTP 服务器
+	httpServer = &http.Server{
+		Handler:      http.DefaultServeMux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	
 	// 使用找到的可用监听器启动服务
-	log.Fatal(http.Serve(listener, nil))
+	if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("HTTP server error: %v", err)
+	}
 }
 
 // logWriter 自定义日志写入器，用于跟踪日志大小
@@ -530,7 +628,11 @@ func loadCacheFromDB() {
 		}
 		
 		entry.Dirty = false
-		memCache[entry.URL] = &entry
+		entry.Size = 0 // 稍后统计实际大小
+		if fileInfo, err := os.Stat(entry.FilePath); err == nil {
+			entry.Size = fileInfo.Size()
+		}
+		lruCache.Put(entry.URL, &entry)
 		count++
 	}
 	
@@ -559,16 +661,14 @@ func syncToDB() {
 		return
 	}
 	
-	memCacheMutex.RLock()
-	// 收集需要同步的条目
+	// 使用LRU缓存的方法收集需要同步的条目
 	var toSync []*CacheEntry
-	for _, entry := range memCache {
+	for _, entry := range lruCache.GetAll() {
 		if entry.Dirty {
 			entryCopy := *entry
 			toSync = append(toSync, &entryCopy)
 		}
 	}
-	memCacheMutex.RUnlock()
 	
 	if len(toSync) == 0 {
 		return
@@ -608,19 +708,17 @@ func syncToDB() {
 	}
 	
 	// 标记已同步
-	memCacheMutex.Lock()
 	for _, entry := range toSync {
-		if cached, exists := memCache[entry.URL]; exists {
+		if cached, exists := lruCache.Get(entry.URL); exists {
 			cached.Dirty = false
 		}
 	}
-	memCacheMutex.Unlock()
 	
 	lastDBSync = time.Now()
 	log.Printf("成功同步 %d 条记录到数据库", len(toSync))
 }
 
-// cleanupMemCache 清理内存缓存
+// cleanupMemCache 定期清理过期的缓存
 func cleanupMemCache() {
 	ticker := time.NewTicker(time.Duration(cacheConfig.CleanupIntervalMin) * time.Minute)
 	defer ticker.Stop()
@@ -631,82 +729,35 @@ func cleanupMemCache() {
 			if !useMemCache {
 				continue
 			}
-		
-		memCacheMutex.Lock()
-		
-		// 计算当前内存缓存大小
-		var currentSize int64
-		var entries []struct {
-			key        string
-			entry      *CacheEntry
-			score      float64 // 访问评分
-		}
-		
-		now := time.Now()
-		for key, entry := range memCache {
-			// 估算条目大小（文件路径长度 + URL长度 + 一些元数据）
-			entrySize := int64(len(entry.URL) + len(entry.FilePath) + len(entry.ThumbPath) + 100)
-			currentSize += entrySize
 			
-			// 计算访问评分（结合访问次数和最近访问时间）
-			timeSinceAccess := now.Sub(entry.LastAccess)
-			accessScore := float64(entry.AccessCount) / (timeSinceAccess.Minutes() + 1)
+			// LRU缓存自动处理大小限制，这里只需要清理过期的条目
+			now := time.Now()
+			cacheValidity := time.Duration(cacheConfig.CacheValidityMin) * time.Minute
 			
-			entries = append(entries, struct {
-				key   string
-				entry *CacheEntry
-				score float64
-			}{key, entry, accessScore})
-		}
-		
-		// 检查是否需要清理
-		maxSize := int64(cacheConfig.MaxMemCacheSizeMB) * 1024 * 1024
-		needCleanup := len(memCache) > cacheConfig.MaxMemCacheEntries || currentSize > maxSize
-		
-		if needCleanup {
-			// 按访问评分排序（评分低的优先清理）
-			sort.Slice(entries, func(i, j int) bool {
-				return entries[i].score < entries[j].score
-			})
-			
-			// 计算需要清理的数量
-			targetEntries := int(float64(cacheConfig.MaxMemCacheEntries) * 0.8) // 清理到80%
-			targetSize := int64(float64(cacheConfig.MaxMemCacheSizeMB) * 1024 * 1024 * 0.8)     // 清理到80%
-			
-			cleanedCount := 0
-			var newSize int64
-			
-			for _, item := range entries {
-				// 保留高评分的条目
-				if len(memCache)-cleanedCount <= targetEntries && currentSize-newSize <= targetSize {
-					break
-				}
-				
-				// 额外条件：超过时间窗口未访问的优先清理
-				accessWindow := time.Duration(cacheConfig.AccessWindowMin) * time.Minute
-				if time.Since(item.entry.LastAccess) > accessWindow {
-					// 如果有未同步的数据，先同步
-					if item.entry.Dirty {
-						syncSingleEntry(item.key, item.entry)
+			expiredCount := 0
+			for key, entry := range lruCache.GetAll() {
+				if now.Sub(entry.LastAccess) > cacheValidity {
+					// 同步脏数据
+					if entry.Dirty {
+						syncSingleEntry(key, entry)
 					}
-					delete(memCache, item.key)
-					cleanedCount++
-					entrySize := int64(len(item.entry.URL) + len(item.entry.FilePath) + len(item.entry.ThumbPath) + 100)
-					newSize += entrySize
+					// 从LRU缓存中删除（会自动删除文件）
+					lruCache.Remove(key)
+					expiredCount++
 				}
 			}
 			
-			if cleanedCount > 0 {
-				log.Printf("内存缓存清理: 移除了 %d 个低频访问条目", cleanedCount)
+			if expiredCount > 0 {
+				log.Printf("清理了 %d 个过期缓存条目", expiredCount)
 			}
-		}
-		
-			memCacheMutex.Unlock()
 			
-			// 显示当前状态
-			log.Printf("内存缓存状态: %d 条目, 约 %.2f MB", len(entries), float64(currentSize)/(1024*1024))
+			// 显示缓存状态
+			log.Printf("LRU缓存状态: %d 条目, 约 %.2f MB", 
+				lruCache.Len(), 
+				float64(lruCache.currentSize)/(1024*1024))
+			
 		case <-cleanupStopChan:
-			log.Println("停止内存缓存清理")
+			log.Println("停止缓存清理")
 			return
 		}
 	}
@@ -742,31 +793,6 @@ func syncSingleEntry(url string, entry *CacheEntry) {
 	}
 }
 
-// setupGracefulShutdown 设置优雅关闭
-func setupGracefulShutdown() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	
-	go func() {
-		<-c
-		log.Println("收到关闭信号，正在保存数据...")
-		
-		// 立即同步到数据库
-		if useMemCache {
-			syncToDB()
-		}
-		
-		// 关闭数据库
-		if db != nil {
-			db.Close()
-		}
-		
-		// 关闭日志
-		closeLogger()
-		
-		os.Exit(0)
-	}()
-}
 
 // closeLogger 关闭日志文件
 func closeLogger() {
@@ -1275,21 +1301,21 @@ func detectImageFormat(data []byte) string {
 func updateCacheRecord(url, filePath, thumbPath, format string, isHit bool, originalSize, compressedSize int64) {
 	// 如果启用内存缓存，更新内存
 	if useMemCache {
-		memCacheMutex.Lock()
-		defer memCacheMutex.Unlock()
-		
 		if isHit {
-			// 缓存命中，更新访问信息
-			if entry, exists := memCache[url]; exists {
-				entry.AccessCount++
-				entry.LastAccess = time.Now()
-				entry.Dirty = true
-			}
+			// 缓存命中，LRU的Get方法会自动更新访问信息
+			lruCache.Get(url)
 			
 			// 更新统计
 			atomic.AddInt64(&cacheHits, 1)
 		} else {
 			// 缓存未命中，添加新记录
+			var fileSize int64
+			if filePath != "" {
+				if fileInfo, err := os.Stat(filePath); err == nil {
+					fileSize = fileInfo.Size()
+				}
+			}
+			
 			entry := &CacheEntry{
 				URL:         url,
 				FilePath:    filePath,
@@ -1299,8 +1325,9 @@ func updateCacheRecord(url, filePath, thumbPath, format string, isHit bool, orig
 				LastAccess:  time.Now(),
 				CreatedAt:   time.Now(),
 				Dirty:       true,
+				Size:        fileSize,
 			}
-			memCache[url] = entry
+			lruCache.Put(url, entry)
 			
 			// 更新统计
 			atomic.AddInt64(&cacheMisses, 1)
@@ -1376,20 +1403,16 @@ func updateCacheRecord(url, filePath, thumbPath, format string, isHit bool, orig
 
 // From cache getting image
 func getFromCache(imageURL string) ([]byte, string, bool) {
-	// 如果启用内存缓存，先从内存查找
+	// 如果启用内存缓存，先从LRU缓存查找
 	if useMemCache {
-		memCacheMutex.RLock()
-		entry, exists := memCache[imageURL]
-		memCacheMutex.RUnlock()
+		entry, exists := lruCache.Get(imageURL)
 		
 		if exists {
 			// 检查是否过期
 			cacheValidity := time.Duration(cacheConfig.CacheValidityMin) * time.Minute
 			if time.Since(entry.LastAccess) > cacheValidity {
 				// 过期了，删除
-				memCacheMutex.Lock()
-				delete(memCache, imageURL)
-				memCacheMutex.Unlock()
+				lruCache.Remove(imageURL)
 				return nil, "", false
 			}
 			
@@ -1397,22 +1420,14 @@ func getFromCache(imageURL string) ([]byte, string, bool) {
 			imgData, err := os.ReadFile(entry.FilePath)
 			if err != nil {
 				log.Printf("Reading cache file failed: %v", err)
-				// 文件不存在，删除内存缓存
+				// 文件不存在，删除缓存
 				if os.IsNotExist(err) {
-					memCacheMutex.Lock()
-					delete(memCache, imageURL)
-					memCacheMutex.Unlock()
+					lruCache.Remove(imageURL)
 				}
 				return nil, "", false
 			}
 			
-			// 更新访问信息
-			memCacheMutex.Lock()
-			entry.AccessCount++
-			entry.LastAccess = time.Now()
-			entry.Dirty = true
-			memCacheMutex.Unlock()
-			
+			// 访问信息已在Get方法中更新
 			return imgData, entry.Format, true
 		}
 	}
@@ -1473,102 +1488,172 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 				}
 				baseURL := fmt.Sprintf("%s://%s", scheme, host)
 				
+				// 获取语言设置
+				lang := getLang(r)
+				langCode := "zh"
+				if cookie, err := r.Cookie("lang"); err == nil {
+					langCode = cookie.Value
+				}
+				
+				// 设置语言切换按钮的active类
+				zhActive := ""
+				enActive := ""
+				if langCode == "zh" {
+					zhActive = "active"
+				} else {
+					enActive = "active"
+				}
+				
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				helpHTML := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WebP 图片代理服务</title>
+    <title>WebP %s</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-        h1 { color: #333; }
-        pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 20px; background: #f5f5f5; }
+        .container { background: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; margin-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; margin-bottom: 15px; border-bottom: 2px solid #4CAF50; padding-bottom: 5px; }
+        pre { background: #f8f9fa; padding: 12px; border-radius: 5px; overflow-x: auto; border: 1px solid #e0e0e0; font-size: 13px; }
         .example { margin: 20px 0; }
+        .example h3 { color: #666; font-size: 14px; margin-bottom: 8px; }
+        .example p { color: #888; font-size: 12px; margin-top: 5px; }
+        .lang-switcher { position: absolute; top: 20px; right: 30px; }
+        .lang-switcher a { text-decoration: none; padding: 5px 15px; background: #4CAF50; color: white; border-radius: 5px; margin-left: 5px; font-size: 14px; }
+        .lang-switcher a:hover { background: #45a049; }
+        .lang-switcher a.active { background: #333; }
+        .management-links { margin-top: 30px; padding: 20px; background: #f0f8ff; border-radius: 5px; }
+        .management-links h2 { margin-top: 0; border-color: #2196F3; }
+        .management-links ul { list-style: none; padding: 0; }
+        .management-links li { margin: 10px 0; }
+        .management-links a { color: #2196F3; text-decoration: none; font-weight: 500; }
+        .management-links a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
-    <h1>WebP 图片代理服务</h1>
-    <h2>使用方法：</h2>
-    
-    <div class="example">
-        <h3>1. 查询参数方式（推荐，保留双斜杠）：</h3>
-        <pre>%s/?url=https://example.com//path//to//image.jpg</pre>
+    <div class="lang-switcher">
+        <a href="javascript:void(0)" onclick="switchLang('zh')" class="%s">中文</a>
+        <a href="javascript:void(0)" onclick="switchLang('en')" class="%s">English</a>
     </div>
     
-    <div class="example">
-        <h3>2. 编码路径方式（用 _DS_ 代表 //）：</h3>
-        <pre>%s/https:_DS_example.com_DS_path_DS_to_DS_image.jpg</pre>
+    <div class="container">
+        <h1>WebP %s</h1>
+        <h2>%s</h2>
+        
+        <div class="example">
+            <h3>1. %s</h3>
+            <pre>%s/?url=https://example.com//path//to//image.jpg</pre>
+        </div>
+        
+        <div class="example">
+            <h3>2. %s</h3>
+            <pre>%s/https:_DS_example.com_DS_path_DS_to_DS_image.jpg</pre>
+        </div>
+        
+        <div class="example">
+            <h3>3. %s</h3>
+            <pre>%s/https://example.com/path/to/image.jpg</pre>
+        </div>
+        
+        <h2>%s</h2>
+        <div class="example">
+            <h3>%s</h3>
+            <pre>%s/?url=https://example.com/image.png&format=webp</pre>
+        </div>
+        
+        <div class="example">
+            <h3>%s</h3>
+            <pre>%s/?url=https://example.com/image.png&format=original</pre>
+        </div>
+        
+        <h2>%s</h2>
+        <div class="example">
+            <h3>%s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=500</pre>
+        </div>
+        
+        <div class="example">
+            <h3>%s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&h=300</pre>
+        </div>
+        
+        <div class="example">
+            <h3>%s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=500&h=300</pre>
+        </div>
+        
+        <div class="example">
+            <h3>%s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=800&format=webp&q=90</pre>
+        </div>
+        
+        <h2>%s</h2>
+        <div class="example">
+            <h3>fit %s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=fit</pre>
+            <p>%s</p>
+        </div>
+        
+        <div class="example">
+            <h3>fill - %s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=fill</pre>
+            <p>%s</p>
+        </div>
+        
+        <div class="example">
+            <h3>stretch - %s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=stretch</pre>
+            <p>%s</p>
+        </div>
+        
+        <div class="example">
+            <h3>pad - %s</h3>
+            <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=pad</pre>
+            <p>%s</p>
+        </div>
+        
+        <div class="management-links">
+            <h2>%s</h2>
+            <ul>
+                <li><a href="/cache">%s</a></li>
+                <li><a href="/stats">%s</a></li>
+            </ul>
+        </div>
     </div>
     
-    <div class="example">
-        <h3>3. 标准路径方式：</h3>
-        <pre>%s/https://example.com/path/to/image.jpg</pre>
-    </div>
-    
-    <h2>格式转换：</h2>
-    <div class="example">
-        <h3>强制转换为 WebP（默认行为）：</h3>
-        <pre>%s/?url=https://example.com/image.png&format=webp</pre>
-    </div>
-    
-    <div class="example">
-        <h3>保持原始格式：</h3>
-        <pre>%s/?url=https://example.com/image.png&format=original</pre>
-    </div>
-    
-    <h2>图片尺寸调整：</h2>
-    <div class="example">
-        <h3>指定宽度（高度自动按比例）：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=500</pre>
-    </div>
-    
-    <div class="example">
-        <h3>指定高度（宽度自动按比例）：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&h=300</pre>
-    </div>
-    
-    <div class="example">
-        <h3>指定宽度和高度（保持纵横比，适应框内）：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300</pre>
-    </div>
-    
-    <div class="example">
-        <h3>组合参数（缩放 + 格式 + 质量）：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=800&format=webp&q=90</pre>
-    </div>
-    
-    <h2>缩放模式（mode 参数）：</h2>
-    <div class="example">
-        <h3>fit（默认）- 适应框内，保持纵横比：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=fit</pre>
-        <p>图片完全显示在指定尺寸内，可能有空白区域</p>
-    </div>
-    
-    <div class="example">
-        <h3>fill - 填充整个框，裁剪多余部分：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=fill</pre>
-        <p>图片填满整个框，可能裁剪掉部分内容</p>
-    </div>
-    
-    <div class="example">
-        <h3>stretch - 拉伸到精确尺寸：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=stretch</pre>
-        <p>强制拉伸到指定尺寸，可能导致图片变形</p>
-    </div>
-    
-    <div class="example">
-        <h3>pad - 适应框内并添加白色边距：</h3>
-        <pre>%s/?url=https://example.com/image.jpg&w=500&h=300&mode=pad</pre>
-        <p>保持纵横比，用白色填充空白区域</p>
-    </div>
-    
-    <h2>管理页面：</h2>
-    <ul>
-        <li><a href="/cache">缓存管理</a></li>
-        <li><a href="/stats">统计信息（JSON）</a></li>
-    </ul>
+    <script>
+    function switchLang(lang) {
+        document.cookie = 'lang=' + lang + '; path=/; max-age=2592000';
+        location.reload();
+    }
+    </script>
 </body>
-</html>`, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL, baseURL)
+</html>`,
+    lang.UI["service_title"],
+    zhActive,
+    enActive,
+    lang.UI["service_title"],
+    lang.UI["usage_title"],
+    lang.UI["query_param_method"], baseURL,
+    lang.UI["encoded_path_method"], baseURL,
+    lang.UI["standard_path_method"], baseURL,
+    lang.UI["format_conversion_title"],
+    lang.UI["force_webp_conversion"], baseURL,
+    lang.UI["keep_original_format"], baseURL,
+    lang.UI["image_resize_title"],
+    lang.UI["specify_width"], baseURL,
+    lang.UI["specify_height"], baseURL,
+    lang.UI["specify_both_dimensions"], baseURL,
+    lang.UI["combined_params"], baseURL,
+    lang.UI["resize_mode_title"],
+    lang.UI["mode_fit_default"], baseURL, lang.UI["mode_fit_desc"],
+    lang.UI["mode_fill"], baseURL, lang.UI["mode_fill_desc"],
+    lang.UI["mode_stretch"], baseURL, lang.UI["mode_stretch_desc"],
+    lang.UI["mode_pad"], baseURL, lang.UI["mode_pad_desc"],
+    lang.UI["management_pages_title"],
+    lang.UI["cache_management"],
+    lang.UI["statistics_json"])
 				w.Write([]byte(helpHTML))
 				return
 			}
@@ -1769,12 +1854,17 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 读取原始图片数据
-		rawImgData, err := io.ReadAll(resp.Body)
+		// 使用缓冲池读取原始图片数据
+		buf := largeBufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer largeBufferPool.Put(buf)
+		
+		_, err = io.Copy(buf, resp.Body)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("读取图片数据失败: %v", err), http.StatusInternalServerError)
 			return
 		}
+		rawImgData := buf.Bytes()
 
 		// 检测图片格式
 		detectedFormat := detectImageFormat(rawImgData)
@@ -1809,28 +1899,31 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 			img = resizeImage(img, targetWidth, targetHeight, resizeMode)
 		}
 		
-		var buf bytes.Buffer
+		// 使用新的缓冲区用于输出
+		outputBuf := largeBufferPool.Get().(*bytes.Buffer)
+		outputBuf.Reset()
+		defer largeBufferPool.Put(outputBuf)
 
 		// 根据参数决定输出格式
 		if forceOriginal && !needResize {
 			// 保持原始格式且不需要缩放
 			format = detectedFormat
-			buf.Write(rawImgData)
+			outputBuf.Write(rawImgData)
 		} else if forceWebP {
 			// 强制转换为 WebP
 			format = "webp"
 			if detectedFormat == "webp" && !needResize {
 				// 如果原始就是 WebP 且不需要缩放，直接使用
-				buf.Write(rawImgData)
+				outputBuf.Write(rawImgData)
 			} else if img != nil {
 				// 需要转换为 WebP 或需要缩放
-				if err := nativewebp.Encode(&buf, img, nil); err != nil {
+				if err := nativewebp.Encode(outputBuf, img, nil); err != nil {
 					http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
 					return
 				}
 			} else {
 				// img 为 nil 但需要 WebP，使用原始数据
-				buf.Write(rawImgData)
+				outputBuf.Write(rawImgData)
 			}
 		} else if forceOriginal && needResize {
 			// 保持原始格式但需要缩放
@@ -1839,7 +1932,7 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 				format = detectedFormat
 				// 目前只能输出 WebP，所以转换为 WebP
 				format = "webp"
-				if err := nativewebp.Encode(&buf, img, nil); err != nil {
+				if err := nativewebp.Encode(outputBuf, img, nil); err != nil {
 					http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
 					return
 				}
@@ -1852,7 +1945,7 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 			if detectedFormat == "webp" && !needResize {
 				// WebP 输入，保持 WebP，不需要缩放
 				format = "webp"
-				buf.Write(rawImgData)
+				outputBuf.Write(rawImgData)
 			} else if detectedFormat == "webp" && needResize {
 				// WebP 输入但需要缩放，因为无法解码WebP，报错
 				http.Error(w, "无法缩放 WebP 格式的图片", http.StatusInternalServerError)
@@ -1863,7 +1956,7 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 					// GIF 需要缩放，只能处理为静态 WebP
 					format = "webp"
 					if img != nil {
-						if err := nativewebp.Encode(&buf, img, nil); err != nil {
+						if err := nativewebp.Encode(outputBuf, img, nil); err != nil {
 							http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
 							return
 						}
@@ -1875,17 +1968,17 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 						// 静态GIF或解码失败，转为静态WebP
 						format = "webp"
 						if img != nil {
-							if err := nativewebp.Encode(&buf, img, nil); err != nil {
+							if err := nativewebp.Encode(outputBuf, img, nil); err != nil {
 								http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
 								return
 							}
 						} else {
-							buf.Write(rawImgData)
+							outputBuf.Write(rawImgData)
 						}
 					} else {
 						// 动态GIF保持原格式
 						format = "gif"
-						if err := gif.EncodeAll(&buf, gifImg); err != nil {
+						if err := gif.EncodeAll(outputBuf, gifImg); err != nil {
 							http.Error(w, fmt.Sprintf("GIF 编码失败: %v", err), http.StatusInternalServerError)
 							return
 						}
@@ -1895,19 +1988,19 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 				// 所有其他格式（PNG、JPEG等）都转换为静态WebP
 				format = "webp"
 				if img != nil {
-					if err := nativewebp.Encode(&buf, img, nil); err != nil {
+					if err := nativewebp.Encode(outputBuf, img, nil); err != nil {
 						http.Error(w, fmt.Sprintf("WebP 编码失败: %v", err), http.StatusInternalServerError)
 						return
 					}
 				} else {
 					// 如果无法解码但是原始格式，使用原始数据
-					buf.Write(rawImgData)
+					outputBuf.Write(rawImgData)
 				}
 			}
 		}
 
 		// 保存到缓存
-		imgData = buf.Bytes()
+		imgData = outputBuf.Bytes()
 		originalSize := int64(len(rawImgData))
 		compressedSize := int64(len(imgData))
 		cachePath := getCacheFilePath(cacheKey, format)
@@ -1946,6 +2039,16 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		updateCacheRecord(cacheKey, "", "", format, true, estimatedOriginalSize, compressedSize)
 	}
 
+	// 生成并检查 ETag
+	etag := generateETag(imgData)
+	w.Header().Set("ETag", etag)
+	
+	// 检查客户端缓存
+	if match := r.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	
 	// 设置适当的Content-Type
 	switch format {
 	case "png":
@@ -2030,12 +2133,8 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	memCacheEntries := 0
 	memCacheEstSize := int64(0)
 	if useMemCache {
-		memCacheMutex.RLock()
-		memCacheEntries = len(memCache)
-		for _, entry := range memCache {
-			memCacheEstSize += int64(len(entry.URL) + len(entry.FilePath) + len(entry.ThumbPath) + 100)
-		}
-		memCacheMutex.RUnlock()
+		memCacheEntries = lruCache.Len()
+		memCacheEstSize = lruCache.currentSize
 	}
 	
 	// 获取当前访问的主机名
@@ -2344,6 +2443,16 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 生成并检查 ETag
+	etag := generateETag(thumbData)
+	w.Header().Set("ETag", etag)
+	
+	// 检查客户端缓存
+	if match := r.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	
 	// 设置正确的Content-Type
 	w.Header().Set("Content-Type", "image/webp")
 	w.Header().Set("Cache-Control", "public, max-age=86400") // 缓存1天
@@ -3653,4 +3762,255 @@ func generateMultiLangHTML(lang *Language, page, pageSize int, sortBy string) st
 	htmlTemplate = strings.ReplaceAll(htmlTemplate, "{{.Sort}}", sortBy)
 	
 	return htmlTemplate
+}
+
+// handleHealth 健康检查端点
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	// 检查数据库连接
+	dbStatus := "ok"
+	if err := db.Ping(); err != nil {
+		dbStatus = "error: " + err.Error()
+	}
+	
+	// 检查缓存目录
+	cacheStatus := "ok"
+	if _, err := os.Stat(cacheDir); err != nil {
+		cacheStatus = "error: " + err.Error()
+	}
+	
+	// 获取内存使用情况
+	memCacheCount := lruCache.Len()
+	
+	// 构建健康状态
+	health := map[string]interface{}{
+		"status": "healthy",
+		"timestamp": time.Now().Unix(),
+		"uptime": time.Since(startTime).Seconds(),
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+			"cache_dir": cacheStatus,
+		},
+		"metrics": map[string]interface{}{
+			"total_requests": atomic.LoadInt64(&requestCount),
+			"cache_hits": atomic.LoadInt64(&cacheHits),
+			"cache_misses": atomic.LoadInt64(&cacheMisses),
+			"memory_cache_entries": memCacheCount,
+		},
+	}
+	
+	// 如果有任何错误，设置状态为不健康
+	if dbStatus != "ok" || cacheStatus != "ok" {
+		health["status"] = "unhealthy"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
+}
+
+// setupGracefulShutdown 设置优雅关闭
+func setupGracefulShutdown() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	
+	go func() {
+		<-sigChan
+		log.Println("收到关闭信号，开始优雅关闭...")
+		
+		// 创建超时上下文
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		// 停止接受新请求并等待现有请求完成
+		if httpServer != nil {
+			if err := httpServer.Shutdown(ctx); err != nil {
+				log.Printf("HTTP服务器关闭失败: %v", err)
+			}
+		}
+		
+		// 停止后台任务
+		close(shutdownChan)
+		close(cleanupStopChan)
+		close(syncStopChan)
+		
+		// 同步内存缓存到数据库
+		if useMemCache {
+			log.Println("正在同步内存缓存到数据库...")
+			syncToDB()
+		}
+		
+		// 关闭数据库连接
+		if db != nil {
+			db.Close()
+		}
+		
+		// 关闭日志文件
+		closeLogger()
+		
+		log.Println("优雅关闭完成")
+		os.Exit(0)
+	}()
+}
+
+// generateETag 生成ETag
+func generateETag(data []byte) string {
+	hash := sha256.Sum256(data)
+	return fmt.Sprintf(`"%x"`, hash)
+}
+
+// NewLRUCache 创建新的LRU缓存
+func NewLRUCache(maxEntries int, maxSizeMB int) *LRUCache {
+	return &LRUCache{
+		entries:    make(map[string]*CacheEntry),
+		maxEntries: maxEntries,
+		maxSizeMB:  maxSizeMB,
+	}
+}
+
+// Get 从LRU缓存获取条目
+func (c *LRUCache) Get(key string) (*CacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	entry, exists := c.entries[key]
+	if !exists {
+		return nil, false
+	}
+	
+	// 移动到链表头部（最近使用）
+	c.moveToHead(entry)
+	entry.AccessCount++
+	entry.LastAccess = time.Now()
+	entry.Dirty = true
+	
+	return entry, true
+}
+
+// Put 添加或更新LRU缓存条目
+func (c *LRUCache) Put(key string, entry *CacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	// 如果已存在，更新并移到头部
+	if existing, exists := c.entries[key]; exists {
+		c.currentSize -= existing.Size
+		c.currentSize += entry.Size
+		existing.FilePath = entry.FilePath
+		existing.ThumbPath = entry.ThumbPath
+		existing.Format = entry.Format
+		existing.Size = entry.Size
+		existing.LastAccess = time.Now()
+		existing.Dirty = true
+		c.moveToHead(existing)
+		return
+	}
+	
+	// 新条目
+	c.entries[key] = entry
+	c.currentSize += entry.Size
+	c.addToHead(entry)
+	
+	// 检查是否超过限制，如果超过则淘汰
+	for (len(c.entries) > c.maxEntries || c.currentSize > int64(c.maxSizeMB)*1024*1024) && c.tail != nil {
+		c.evictTail()
+	}
+}
+
+// moveToHead 移动节点到链表头部
+func (c *LRUCache) moveToHead(entry *CacheEntry) {
+	c.removeFromList(entry)
+	c.addToHead(entry)
+}
+
+// addToHead 添加节点到链表头部
+func (c *LRUCache) addToHead(entry *CacheEntry) {
+	entry.prev = nil
+	entry.next = c.head
+	
+	if c.head != nil {
+		c.head.prev = entry
+	}
+	c.head = entry
+	
+	if c.tail == nil {
+		c.tail = entry
+	}
+}
+
+// removeFromList 从链表中移除节点
+func (c *LRUCache) removeFromList(entry *CacheEntry) {
+	if entry.prev != nil {
+		entry.prev.next = entry.next
+	} else {
+		c.head = entry.next
+	}
+	
+	if entry.next != nil {
+		entry.next.prev = entry.prev
+	} else {
+		c.tail = entry.prev
+	}
+}
+
+// evictTail 淘汰最久未使用的条目
+func (c *LRUCache) evictTail() {
+	if c.tail == nil {
+		return
+	}
+	
+	toEvict := c.tail
+	delete(c.entries, toEvict.URL)
+	c.currentSize -= toEvict.Size
+	c.removeFromList(toEvict)
+	
+	// 删除文件
+	if toEvict.FilePath != "" {
+		os.Remove(toEvict.FilePath)
+	}
+	if toEvict.ThumbPath != "" {
+		os.Remove(toEvict.ThumbPath)
+	}
+	
+	log.Printf("LRU淘汰缓存: %s (大小: %d bytes)", toEvict.URL, toEvict.Size)
+}
+
+// GetAll 获取所有缓存条目（用于同步到数据库）
+func (c *LRUCache) GetAll() map[string]*CacheEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	result := make(map[string]*CacheEntry)
+	for k, v := range c.entries {
+		result[k] = v
+	}
+	return result
+}
+
+// Len 返回缓存条目数量
+func (c *LRUCache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
+// Remove 删除指定的缓存条目
+func (c *LRUCache) Remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	if entry, exists := c.entries[key]; exists {
+		delete(c.entries, key)
+		c.currentSize -= entry.Size
+		c.removeFromList(entry)
+		
+		// 删除文件
+		if entry.FilePath != "" {
+			os.Remove(entry.FilePath)
+		}
+		if entry.ThumbPath != "" {
+			os.Remove(entry.ThumbPath)
+		}
+	}
 }
