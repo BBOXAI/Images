@@ -39,3 +39,10 @@ test_webpimg
 test_cleanup.go
 test_cache.go
 test_cache
+/uploads
+test_transform.sh
+test_storage.py
+test_storage.go
+test_cache_levels.go
+test.svg
+test.jpg

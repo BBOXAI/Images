@@ -9,13 +9,17 @@
 ### 功能特性
 
 - 🚀 自动将图片转换为WebP格式，大幅减小文件体积
-- 💾 智能缓存系统，支持内存缓存和磁盘缓存
+- 💾 三层存储架构：内存→本地→远程（可配置）
 - 📊 实时统计和可视化管理界面
 - 🔒 密码保护的管理后台
 - 🌐 中英双语支持
 - 📱 响应式界面设计
 - ⚡ 高并发支持，内存缓存可减少数据库压力
 - 🎨 支持图片缩放和多种调整模式
+- 📤 图片上传功能，支持拖拽和批量上传
+- 🔄 集成 [zots0127/io](https://github.com/zots0127/io) 去重存储后端（可选）
+- 🏷️ 智能变换缓存：基于参数组合的缓存键，避免重复处理
+- 📈 缓存层级信息：HTTP响应头显示数据来源（Memory/Local/Remote）
 
 ### 快速部署
 
@@ -69,6 +73,37 @@ irm https://raw.githubusercontent.com/BBOXAI/Images/main/install.ps1 | iex
    - 图片代理: `http://localhost:8080/[图片URL]`
    - 管理界面: `http://localhost:8080/cache`
    - 统计信息: `http://localhost:8080/stats`
+   - 上传界面: `http://localhost:8080/upload`
+
+### 存储配置
+
+支持灵活的三层存储架构配置：
+
+```bash
+# 默认配置（内存+本地）
+./webpimg
+
+# 仅内存缓存
+STORAGE_MEMORY=true STORAGE_LOCAL=false ./webpimg
+
+# 完整三层存储（内存+本地+远程）
+STORAGE_MEMORY=true \
+STORAGE_LOCAL=true \
+STORAGE_REMOTE=true \
+./webpimg
+
+# 自定义远程存储配置
+STORAGE_REMOTE=true \
+STORAGE_REMOTE_URL=http://your-io-backend:7777 \
+STORAGE_REMOTE_APIKEY=your-api-key \
+./webpimg
+```
+
+存储策略说明：
+- **内存层**：最快速度，适合热点数据缓存
+- **本地层**：本地磁盘存储，持久化保存
+- **远程层**：集成 io 后端，支持去重和分布式存储
+- **自动缓存**：数据会自动从慢层缓存到快层
 
 #### 服务管理
 
@@ -178,13 +213,17 @@ http://localhost:8080/https://example.com/image.jpg?w=400&h=300&mode=fill
 ### Features
 
 - 🚀 Automatically converts images to WebP format, significantly reducing file size
-- 💾 Smart caching system with memory and disk cache support
+- 💾 Three-tier storage architecture: Memory → Local → Remote (configurable)
 - 📊 Real-time statistics and visual management interface
 - 🔒 Password-protected admin panel
 - 🌐 Bilingual support (Chinese/English)
 - 📱 Responsive interface design
 - ⚡ High concurrency support with memory cache to reduce database load
 - 🎨 Image resizing with multiple adjustment modes
+- 📤 Image upload feature with drag-and-drop and batch upload support
+- 🔄 Integration with [zots0127/io](https://github.com/zots0127/io) deduplication storage backend (optional)
+- 🏷️ Smart transform caching: Parameter-based cache keys to avoid redundant processing
+- 📈 Cache level information: HTTP response headers show data source (Memory/Local/Remote)
 
 ### Quick Deployment
 
@@ -238,6 +277,7 @@ The installation script will automatically:
    - Image Proxy: `http://localhost:8080/[image-url]`
    - Admin Panel: `http://localhost:8080/cache`
    - Statistics: `http://localhost:8080/stats`
+   - Upload Interface: `http://localhost:8080/upload`
 
 #### Service Management
 
@@ -355,6 +395,8 @@ Returns JSON statistics data:
 - Cache hit rate
 - Space savings statistics
 - Format distribution
+- Memory cache status
+- Storage tier information
 
 ### Cache Management
 
@@ -364,6 +406,50 @@ GET /cache?page=1&page_size=20  # Paginated data
 POST /cache/control?action=toggle  # Toggle memory cache
 POST /cache/control?action=sync    # Sync to database immediately
 ```
+
+### Storage Files
+
+```bash
+GET /storage/{file_id}     # Get stored file
+GET /storage/{file_id}?w=200&h=200  # With transformation
+```
+
+### Upload
+
+```bash
+POST /api/upload           # Upload images
+```
+
+Form data:
+- `images`: Multiple image files
+
+Returns:
+```json
+{
+  "message": "Successfully uploaded 2 images",
+  "urls": ["/storage/abc123.jpg", "/storage/def456.png"],
+  "duplicates": 0
+}
+```
+
+### Response Headers
+
+The service adds informative headers to responses:
+
+- `X-Cache-Level`: Storage tier that served the request (Memory/Local/IOBackend/Transform)
+- `X-Cache-Status`: Cache hit status
+  - `HIT-MEMORY`: Served from memory cache
+  - `HIT-MEMORY-TRANSFORM`: Transformed image from memory cache
+  - `HIT-LOCAL`: Served from local disk
+  - `HIT-LOCAL-TRANSFORM`: Transformed image from local disk
+  - `HIT-REMOTE`: Served from remote backend
+  - `TRANSFORM-ON-DEMAND`: Real-time transformation
+  - `MISS`: Not found in any cache
+- `X-Transform-Key`: Unique key for transformed images
+- `X-Transform-Params`: Transformation parameters applied
+- `X-Storage-ID`: Original file storage ID
+- `X-Image-Width`: Image width in pixels
+- `X-Image-Height`: Image height in pixels
 
 ## System Requirements
 

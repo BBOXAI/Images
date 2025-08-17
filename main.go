@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -12,18 +15,21 @@ import (
 	"image"
 	"image/color"
 	"image/gif"
-	_ "image/jpeg"
-	_ "image/png"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"math"
 	"math/rand"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -179,6 +185,8 @@ var languages = map[string]*Language{
 			"management_pages_title": "管理页面：",
 			"cache_management": "缓存管理",
 			"statistics_json": "统计信息（JSON）",
+			"image_upload": "图片上传",
+			"backend_note": "长期存储后端基于",
 		},
 	},
 	"en": {
@@ -279,8 +287,64 @@ var languages = map[string]*Language{
 			"management_pages_title": "Management Pages:",
 			"cache_management": "Cache Management",
 			"statistics_json": "Statistics (JSON)",
+			"image_upload": "Image Upload",
+			"backend_note": "Long-term storage backend based on",
 		},
 	},
+}
+
+// StorageBackend 存储后端接口
+type StorageBackend interface {
+	// Store 存储文件，返回文件ID
+	Store(data []byte, metadata map[string]string) (string, error)
+	// Get 获取文件
+	Get(id string) ([]byte, error)
+	// Exists 检查文件是否存在
+	Exists(id string) bool
+	// Delete 删除文件
+	Delete(id string) error
+	// Name 返回存储后端名称
+	Name() string
+}
+
+// StorageManager 存储管理器，管理多层存储
+type StorageManager struct {
+	backends []StorageBackend
+	mu       sync.RWMutex
+}
+
+// MemoryStorage 内存存储后端
+type MemoryStorage struct {
+	cache    *LRUCache
+	data     map[string][]byte
+	mu       sync.RWMutex
+	maxSize  int64
+	currSize int64
+}
+
+// LocalStorage 本地文件存储后端
+type LocalStorage struct {
+	basePath string
+	mu       sync.RWMutex
+}
+
+// IOBackendStorage 远程io存储后端
+type IOBackendStorage struct {
+	apiURL   string
+	apiKey   string
+	client   *http.Client
+	enabled  bool
+}
+
+// StorageConfig 存储配置
+type StorageConfig struct {
+	EnableMemory   bool   `json:"enable_memory"`
+	EnableLocal    bool   `json:"enable_local"`
+	EnableRemote   bool   `json:"enable_remote"`
+	MemoryMaxSize  int64  `json:"memory_max_size"`
+	LocalPath      string `json:"local_path"`
+	RemoteURL      string `json:"remote_url"`
+	RemoteAPIKey   string `json:"remote_api_key"`
 }
 
 var (
@@ -297,7 +361,24 @@ var (
 	logSize      int64
 	maxLogSize   = int64(10 * 1024 * 1024) // 10MB per log file
 	httpServer   *http.Server              // HTTP服务器引用，用于优雅关闭
+	ioBackendURL = "http://localhost:7777" // io 后端服务地址
+	ioAPIKey     = "" // io 后端API密钥
+	ioProcess    *exec.Cmd // io 后端进程
 	shutdownChan = make(chan struct{})     // 关闭信号通道
+	
+	// 全局存储管理器
+	storageManager *StorageManager
+	
+	// 默认存储配置
+	defaultStorageConfig = StorageConfig{
+		EnableMemory:  true,
+		EnableLocal:   true,
+		EnableRemote:  false,
+		MemoryMaxSize: 50 * 1024 * 1024, // 50MB内存缓存
+		LocalPath:     "uploads",
+		RemoteURL:     "http://localhost:7777",
+		RemoteAPIKey:  "",
+	}
 	
 	// 内存缓存相关
 	lruCache      *LRUCache  // LRU缓存管理器
@@ -358,7 +439,188 @@ func getLang(r *http.Request) *Language {
 	return languages[currentLang]
 }
 
+// downloadAndStartIOBackend 下载并启动 io 存储后端（可选）
+func downloadAndStartIOBackend(config *StorageConfig) error {
+	if !config.EnableRemote {
+		log.Println("远程io存储未启用")
+		return nil
+	}
+	log.Println("正在检查 io 存储后端...")
+	
+	// 创建 io-backend 目录
+	backendDir := "io-backend"
+	if err := os.MkdirAll(backendDir, 0755); err != nil {
+		return fmt.Errorf("创建后端目录失败: %v", err)
+	}
+	
+	// 检测系统架构
+	var platform string
+	switch runtime.GOOS {
+	case "darwin":
+		if runtime.GOARCH == "arm64" {
+			platform = "darwin-arm64"
+		} else {
+			platform = "darwin-amd64"
+		}
+	case "linux":
+		if runtime.GOARCH == "arm64" {
+			platform = "linux-arm64"
+		} else {
+			platform = "linux-amd64"
+		}
+	case "windows":
+		platform = "windows-amd64"
+	default:
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+	
+	binaryName := "io"
+	if runtime.GOOS == "windows" {
+		binaryName = "io.exe"
+	}
+	binaryPath := filepath.Join(backendDir, binaryName)
+	
+	// 检查二进制文件是否已存在
+	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		log.Printf("正在下载 io 存储后端 (%s)...", platform)
+		
+		// 下载最新版本
+		downloadURL := fmt.Sprintf("https://github.com/zots0127/io/releases/latest/download/io-%s.tar.gz", platform)
+		
+		resp, err := http.Get(downloadURL)
+		if err != nil {
+			return fmt.Errorf("下载失败: %v", err)
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+		}
+		
+		// 解压 tar.gz
+		gzReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return fmt.Errorf("解压失败: %v", err)
+		}
+		defer gzReader.Close()
+		
+		tarReader := tar.NewReader(gzReader)
+		
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("读取tar失败: %v", err)
+			}
+			
+			// 只提取 io 二进制文件
+			if header.Name == binaryName || header.Name == "./"+binaryName {
+				outFile, err := os.OpenFile(binaryPath, os.O_CREATE|os.O_WRONLY, 0755)
+				if err != nil {
+					return fmt.Errorf("创建文件失败: %v", err)
+				}
+				
+				if _, err := io.Copy(outFile, tarReader); err != nil {
+					outFile.Close()
+					return fmt.Errorf("写入文件失败: %v", err)
+				}
+				outFile.Close()
+				
+				log.Println("io 存储后端下载完成")
+				break
+			}
+		}
+	}
+	
+	// 生成随机 API 密钥
+	if config.RemoteAPIKey == "" {
+		rand.Seed(time.Now().UnixNano())
+		b := make([]byte, 32)
+		for i := range b {
+			b[i] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[rand.Intn(62)]
+		}
+		config.RemoteAPIKey = string(b)
+		log.Printf("生成 io API 密钥: %s", config.RemoteAPIKey)
+	}
+	ioAPIKey = config.RemoteAPIKey
+	
+	// 创建 io 存储目录
+	ioStorageDir := filepath.Join(backendDir, "storage")
+	if err := os.MkdirAll(ioStorageDir, 0755); err != nil {
+		return fmt.Errorf("创建存储目录失败: %v", err)
+	}
+	
+	// 启动 io 后端
+	log.Println("正在启动 io 存储后端...")
+	ioProcess = exec.Command(binaryPath,
+		"-port", "7777",
+		"-storage", ioStorageDir,
+		"-db", filepath.Join(backendDir, "io.db"),
+		"-api-key", ioAPIKey,
+	)
+	
+	ioProcess.Stdout = os.Stdout
+	ioProcess.Stderr = os.Stderr
+	
+	if err := ioProcess.Start(); err != nil {
+		return fmt.Errorf("启动 io 后端失败: %v", err)
+	}
+	
+	// 等待后端启动
+	time.Sleep(2 * time.Second)
+	
+	// 检查后端是否正常运行
+	resp, err := http.Get(ioBackendURL + "/health")
+	if err == nil {
+		resp.Body.Close()
+		log.Println("io 存储后端启动成功")
+	} else {
+		log.Printf("警告: io 后端健康检查失败: %v", err)
+	}
+	
+	return nil
+}
+
 func main() {
+	log.Println("正在初始化服务...")
+	
+	// 加载存储配置（可以从环境变量或配置文件读取）
+	storageConfig := defaultStorageConfig
+	
+	// 从环境变量读取配置
+	if os.Getenv("STORAGE_MEMORY") == "false" {
+		storageConfig.EnableMemory = false
+	}
+	if os.Getenv("STORAGE_LOCAL") == "false" {
+		storageConfig.EnableLocal = false
+	}
+	if os.Getenv("STORAGE_REMOTE") == "true" {
+		storageConfig.EnableRemote = true
+	}
+	if remoteURL := os.Getenv("STORAGE_REMOTE_URL"); remoteURL != "" {
+		storageConfig.RemoteURL = remoteURL
+	}
+	if apiKey := os.Getenv("STORAGE_REMOTE_APIKEY"); apiKey != "" {
+		storageConfig.RemoteAPIKey = apiKey
+	}
+	
+	// 如果启用远程存储，尝试启动 io 后端
+	if storageConfig.EnableRemote {
+		if err := downloadAndStartIOBackend(&storageConfig); err != nil {
+			log.Printf("警告: 无法启动 io 存储后端: %v", err)
+			storageConfig.EnableRemote = false
+		}
+	}
+	
+	// 初始化存储管理器
+	storageManager = NewStorageManager(storageConfig)
+	log.Printf("存储配置: 内存=%v, 本地=%v, 远程=%v", 
+		storageConfig.EnableMemory, 
+		storageConfig.EnableLocal, 
+		storageConfig.EnableRemote)
+	
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Fatalf("创建缓存目录失败: %v", err)
 	}
@@ -366,6 +628,12 @@ func main() {
 	thumbDir := filepath.Join(cacheDir, "thumbs")
 	if err := os.MkdirAll(thumbDir, 0755); err != nil {
 		log.Fatalf("创建缩略图目录失败: %v", err)
+	}
+	
+	// 创建上传目录
+	uploadsDir := "uploads"
+	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+		log.Fatalf("创建上传目录失败: %v", err)
 	}
 
 	// 初始化日志系统
@@ -399,6 +667,11 @@ func main() {
 
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/stats", handleStats)
+	http.HandleFunc("/upload", handleUpload)
+	http.HandleFunc("/api/upload", handleAPIUpload)
+	http.HandleFunc("/storage/", handleStorageFiles)
+	http.HandleFunc("/uploads/", handleUploads)  // 保留兼容旧的本地上传
+	http.HandleFunc("/io/", handleIOFiles)       // 保留兼容旧的io后端
 	http.HandleFunc("/cache/control", handleCacheControl)
 	http.HandleFunc("/cache", handleCacheList)
 	http.HandleFunc("/thumb/", handleThumbnail)
@@ -926,11 +1199,21 @@ func initDB() {
 		format TEXT,
 		access_count INTEGER DEFAULT 1,
 		last_access TIMESTAMP,
-		created_at TIMESTAMP
+		created_at TIMESTAMP,
+		file_size INTEGER DEFAULT 0,
+		content_type TEXT DEFAULT '',
+		width INTEGER DEFAULT 0,
+		height INTEGER DEFAULT 0
 	)`)
 	if err != nil {
 		log.Fatalf("Creating cache table failed: %v", err)
 	}
+	
+	// 尝试添加缺失的列（兼容旧数据库）
+	db.Exec(`ALTER TABLE cache ADD COLUMN file_size INTEGER DEFAULT 0`)
+	db.Exec(`ALTER TABLE cache ADD COLUMN content_type TEXT DEFAULT ''`)
+	db.Exec(`ALTER TABLE cache ADD COLUMN width INTEGER DEFAULT 0`)
+	db.Exec(`ALTER TABLE cache ADD COLUMN height INTEGER DEFAULT 0`)
 
 	// 	Create stats table
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS stats (
@@ -1618,7 +1901,9 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
             <ul>
                 <li><a href="/cache">%s</a></li>
                 <li><a href="/stats">%s</a></li>
+                <li><a href="/upload">%s</a></li>
             </ul>
+            <p style="margin-top: 15px; color: #666; font-size: 12px;">%s <a href="https://github.com/zots0127/io" target="_blank" style="color: #2196F3;">github.com/zots0127/io</a></p>
         </div>
     </div>
     
@@ -1653,7 +1938,9 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
     lang.UI["mode_pad"], baseURL, lang.UI["mode_pad_desc"],
     lang.UI["management_pages_title"],
     lang.UI["cache_management"],
-    lang.UI["statistics_json"])
+    lang.UI["statistics_json"],
+    lang.UI["image_upload"],
+    lang.UI["backend_note"])
 				w.Write([]byte(helpHTML))
 				return
 			}
@@ -3841,6 +4128,16 @@ func setupGracefulShutdown() {
 			syncToDB()
 		}
 		
+		// 关闭 io 后端进程
+		if ioProcess != nil {
+			log.Println("正在关闭 io 存储后端...")
+			if err := ioProcess.Process.Signal(syscall.SIGTERM); err != nil {
+				log.Printf("发送终止信号失败: %v", err)
+				ioProcess.Process.Kill()
+			}
+			ioProcess.Wait()
+		}
+		
 		// 关闭数据库连接
 		if db != nil {
 			db.Close()
@@ -3860,6 +4157,484 @@ func generateETag(data []byte) string {
 	return fmt.Sprintf(`"%x"`, hash)
 }
 
+// 实现 MemoryStorage
+func NewMemoryStorage(maxSize int64) *MemoryStorage {
+	return &MemoryStorage{
+		cache:   NewLRUCache(1000, int(maxSize/1024/1024)),
+		data:    make(map[string][]byte),
+		maxSize: maxSize,
+	}
+}
+
+func (m *MemoryStorage) Store(data []byte, metadata map[string]string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// 检查是否有自定义ID
+	id := ""
+	if customID, ok := metadata["custom_id"]; ok && customID != "" {
+		id = customID
+	} else {
+		// 生成ID (使用SHA1)
+		hasher := sha1.New()
+		hasher.Write(data)
+		id = hex.EncodeToString(hasher.Sum(nil))
+	}
+	
+	// 检查大小限制
+	if int64(len(data)) > m.maxSize {
+		return "", fmt.Errorf("文件大小超过内存限制")
+	}
+	
+	// 如果需要释放空间
+	for m.currSize+int64(len(data)) > m.maxSize && len(m.data) > 0 {
+		// 移除最旧的项（简化实现）
+		for oldID := range m.data {
+			delete(m.data, oldID)
+			m.currSize -= int64(len(m.data[oldID]))
+			break
+		}
+	}
+	
+	m.data[id] = data
+	m.currSize += int64(len(data))
+	
+	return id, nil
+}
+
+func (m *MemoryStorage) Get(id string) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	data, exists := m.data[id]
+	if !exists {
+		return nil, fmt.Errorf("文件不存在: %s", id)
+	}
+	
+	return data, nil
+}
+
+func (m *MemoryStorage) Exists(id string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	_, exists := m.data[id]
+	return exists
+}
+
+func (m *MemoryStorage) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if data, exists := m.data[id]; exists {
+		m.currSize -= int64(len(data))
+		delete(m.data, id)
+	}
+	
+	return nil
+}
+
+func (m *MemoryStorage) Name() string {
+	return "Memory"
+}
+
+// 实现 LocalStorage
+func NewLocalStorage(basePath string) *LocalStorage {
+	os.MkdirAll(basePath, 0755)
+	return &LocalStorage{
+		basePath: basePath,
+	}
+}
+
+func (l *LocalStorage) Store(data []byte, metadata map[string]string) (string, error) {
+	// 检查是否有自定义ID
+	id := ""
+	if customID, ok := metadata["custom_id"]; ok && customID != "" {
+		id = customID
+	} else {
+		// 生成ID
+		hasher := sha1.New()
+		hasher.Write(data)
+		id = hex.EncodeToString(hasher.Sum(nil))
+	}
+	
+	// 构建文件路径 (使用前两个字符作为子目录)
+	subDir := id[:2]
+	dirPath := filepath.Join(l.basePath, subDir)
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return "", err
+	}
+	
+	filePath := filepath.Join(dirPath, id)
+	
+	// 如果文件已存在，直接返回
+	if _, err := os.Stat(filePath); err == nil {
+		return id, nil
+	}
+	
+	// 写入文件
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return "", err
+	}
+	
+	return id, nil
+}
+
+func (l *LocalStorage) Get(id string) ([]byte, error) {
+	subDir := id[:2]
+	filePath := filepath.Join(l.basePath, subDir, id)
+	
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("读取文件失败: %v", err)
+	}
+	
+	return data, nil
+}
+
+func (l *LocalStorage) Exists(id string) bool {
+	subDir := id[:2]
+	filePath := filepath.Join(l.basePath, subDir, id)
+	
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+func (l *LocalStorage) Delete(id string) error {
+	subDir := id[:2]
+	filePath := filepath.Join(l.basePath, subDir, id)
+	
+	return os.Remove(filePath)
+}
+
+func (l *LocalStorage) Name() string {
+	return "Local"
+}
+
+// 实现 IOBackendStorage
+func NewIOBackendStorage(apiURL, apiKey string) *IOBackendStorage {
+	return &IOBackendStorage{
+		apiURL:  apiURL,
+		apiKey:  apiKey,
+		client:  &http.Client{Timeout: 30 * time.Second},
+		enabled: true,
+	}
+}
+
+func (i *IOBackendStorage) Store(data []byte, metadata map[string]string) (string, error) {
+	if !i.enabled {
+		return "", fmt.Errorf("io后端未启用")
+	}
+	
+	// 检查是否有自定义ID
+	sha1Hash := ""
+	if customID, ok := metadata["custom_id"]; ok && customID != "" {
+		sha1Hash = customID
+	} else {
+		// 计算SHA1
+		hasher := sha1.New()
+		hasher.Write(data)
+		sha1Hash = hex.EncodeToString(hasher.Sum(nil))
+	}
+	
+	// 检查是否已存在
+	if i.Exists(sha1Hash) {
+		return sha1Hash, nil
+	}
+	
+	// 上传文件
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "data")
+	if err != nil {
+		return "", err
+	}
+	if _, err := part.Write(data); err != nil {
+		return "", err
+	}
+	writer.Close()
+	
+	req, err := http.NewRequest("POST", i.apiURL+"/api/store", body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-API-Key", i.apiKey)
+	
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("上传失败: HTTP %d", resp.StatusCode)
+	}
+	
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	
+	if id, ok := result["sha1"].(string); ok {
+		return id, nil
+	}
+	
+	return sha1Hash, nil
+}
+
+func (i *IOBackendStorage) Get(id string) ([]byte, error) {
+	if !i.enabled {
+		return nil, fmt.Errorf("io后端未启用")
+	}
+	
+	req, err := http.NewRequest("GET", i.apiURL+"/api/file/"+id, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-API-Key", i.apiKey)
+	
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("获取文件失败: HTTP %d", resp.StatusCode)
+	}
+	
+	return io.ReadAll(resp.Body)
+}
+
+func (i *IOBackendStorage) Exists(id string) bool {
+	if !i.enabled {
+		return false
+	}
+	
+	req, err := http.NewRequest("GET", i.apiURL+"/api/exists/"+id, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-API-Key", i.apiKey)
+	
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	
+	return resp.StatusCode == http.StatusOK
+}
+
+func (i *IOBackendStorage) Delete(id string) error {
+	if !i.enabled {
+		return fmt.Errorf("io后端未启用")
+	}
+	
+	req, err := http.NewRequest("DELETE", i.apiURL+"/api/file/"+id, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-API-Key", i.apiKey)
+	
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("删除失败: HTTP %d", resp.StatusCode)
+	}
+	
+	return nil
+}
+
+func (i *IOBackendStorage) Name() string {
+	return "IOBackend"
+}
+
+// 实现 StorageManager
+func NewStorageManager(config StorageConfig) *StorageManager {
+	sm := &StorageManager{
+		backends: make([]StorageBackend, 0),
+	}
+	
+	// 按优先级添加存储后端：内存 -> 本地 -> 远程
+	if config.EnableMemory {
+		sm.backends = append(sm.backends, NewMemoryStorage(config.MemoryMaxSize))
+		log.Println("启用内存存储层")
+	}
+	
+	if config.EnableLocal {
+		sm.backends = append(sm.backends, NewLocalStorage(config.LocalPath))
+		log.Println("启用本地存储层")
+	}
+	
+	if config.EnableRemote && config.RemoteAPIKey != "" {
+		sm.backends = append(sm.backends, NewIOBackendStorage(config.RemoteURL, config.RemoteAPIKey))
+		log.Println("启用远程io存储层")
+	}
+	
+	return sm
+}
+
+// Store 分层存储文件
+func (sm *StorageManager) Store(data []byte, metadata map[string]string) (string, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	
+	if len(sm.backends) == 0 {
+		return "", fmt.Errorf("没有可用的存储后端")
+	}
+	
+	var lastErr error
+	var fileID string
+	
+	// 尝试存储到最后一层（通常是最持久的）
+	for i := len(sm.backends) - 1; i >= 0; i-- {
+		backend := sm.backends[i]
+		id, err := backend.Store(data, metadata)
+		if err == nil {
+			fileID = id
+			log.Printf("文件存储到 %s: %s", backend.Name(), id)
+			
+			// 成功存储后，向上层缓存（异步）
+			go func(upperBackends []StorageBackend, data []byte, id string) {
+				for j := i - 1; j >= 0; j-- {
+					if _, err := upperBackends[j].Store(data, metadata); err == nil {
+						log.Printf("文件缓存到 %s: %s", upperBackends[j].Name(), id)
+					}
+				}
+			}(sm.backends, data, id)
+			
+			return fileID, nil
+		}
+		lastErr = err
+		log.Printf("存储到 %s 失败: %v", backend.Name(), err)
+	}
+	
+	return "", fmt.Errorf("所有存储后端都失败: %v", lastErr)
+}
+
+// StorageResult 存储结果，包含数据和层级信息
+type StorageResult struct {
+	Data      []byte
+	CacheLevel string
+}
+
+// Get 分层获取文件
+func (sm *StorageManager) Get(id string) ([]byte, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	
+	var lastErr error
+	
+	// 从最快的层开始查找
+	for i, backend := range sm.backends {
+		data, err := backend.Get(id)
+		if err == nil {
+			atomic.AddInt64(&cacheHits, 1)
+			log.Printf("从 %s 获取文件: %s", backend.Name(), id)
+			
+			// 如果不是从第一层获取的，缓存到上层（异步）
+			if i > 0 {
+				go func(upperBackends []StorageBackend, data []byte, id string) {
+					for j := i - 1; j >= 0; j-- {
+						if _, err := upperBackends[j].Store(data, nil); err == nil {
+							log.Printf("文件缓存到 %s: %s", upperBackends[j].Name(), id)
+						}
+					}
+				}(sm.backends, data, id)
+			}
+			
+			return data, nil
+		}
+		lastErr = err
+	}
+	
+	atomic.AddInt64(&cacheMisses, 1)
+	return nil, fmt.Errorf("文件未找到: %v", lastErr)
+}
+
+// GetWithLevel 分层获取文件，返回缓存层级信息
+func (sm *StorageManager) GetWithLevel(id string) (*StorageResult, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	
+	var lastErr error
+	
+	// 从最快的层开始查找
+	for i, backend := range sm.backends {
+		data, err := backend.Get(id)
+		if err == nil {
+			atomic.AddInt64(&cacheHits, 1)
+			cacheLevel := backend.Name()
+			log.Printf("从 %s 获取文件: %s", cacheLevel, id)
+			
+			// 如果不是从第一层获取的，缓存到上层（异步）
+			if i > 0 {
+				go func(upperBackends []StorageBackend, data []byte, id string) {
+					for j := i - 1; j >= 0; j-- {
+						if _, err := upperBackends[j].Store(data, nil); err == nil {
+							log.Printf("文件缓存到 %s: %s", upperBackends[j].Name(), id)
+						}
+					}
+				}(sm.backends, data, id)
+			}
+			
+			return &StorageResult{
+				Data:       data,
+				CacheLevel: cacheLevel,
+			}, nil
+		}
+		lastErr = err
+	}
+	
+	atomic.AddInt64(&cacheMisses, 1)
+	return nil, fmt.Errorf("文件未找到: %v", lastErr)
+}
+
+// Exists 检查文件是否存在
+func (sm *StorageManager) Exists(id string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	
+	for _, backend := range sm.backends {
+		if backend.Exists(id) {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// Delete 从所有层删除文件
+func (sm *StorageManager) Delete(id string) error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	
+	var lastErr error
+	deleted := false
+	
+	// 从所有层删除
+	for _, backend := range sm.backends {
+		if err := backend.Delete(id); err == nil {
+			deleted = true
+			log.Printf("从 %s 删除文件: %s", backend.Name(), id)
+		} else {
+			lastErr = err
+		}
+	}
+	
+	if deleted {
+		return nil
+	}
+	
+	return lastErr
+}
+
 // NewLRUCache 创建新的LRU缓存
 func NewLRUCache(maxEntries int, maxSizeMB int) *LRUCache {
 	return &LRUCache{
@@ -3867,6 +4642,898 @@ func NewLRUCache(maxEntries int, maxSizeMB int) *LRUCache {
 		maxEntries: maxEntries,
 		maxSizeMB:  maxSizeMB,
 	}
+}
+
+// handleUpload 处理上传页面
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	// 获取用户语言偏好
+	langObj := getLang(r)
+	lang := langObj.Code
+	
+	// 构建页面HTML
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="%s">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>%s</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%%;
+            padding: 40px;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 2rem;
+        }
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #f9f9ff;
+        }
+        .upload-area:hover, .upload-area.dragover {
+            background: #f0f0ff;
+            border-color: #764ba2;
+        }
+        .upload-icon {
+            font-size: 48px;
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        .upload-text {
+            color: #666;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+        .upload-subtext {
+            color: #999;
+            font-size: 14px;
+        }
+        .upload-button {
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 20px;
+            transition: transform 0.2s;
+            display: none;
+        }
+        .upload-button:hover {
+            transform: scale(1.05);
+        }
+        .upload-button:active {
+            transform: scale(0.95);
+        }
+        .preview-container {
+            margin-top: 30px;
+            display: none;
+        }
+        .preview-image {
+            max-width: 100%%;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+        }
+        .file-info {
+            margin-top: 15px;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+        .progress-bar {
+            width: 100%%;
+            height: 6px;
+            background: #e0e0e0;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 20px;
+            display: none;
+        }
+        .progress-fill {
+            height: 100%%;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            width: 0%%;
+            transition: width 0.3s;
+        }
+        .result {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f0fff4;
+            border: 1px solid #4caf50;
+            border-radius: 10px;
+            display: none;
+        }
+        .result-title {
+            color: #4caf50;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .result-link {
+            color: #667eea;
+            word-break: break-all;
+            text-decoration: none;
+        }
+        .result-link:hover {
+            text-decoration: underline;
+        }
+        .error {
+            background: #fff0f0;
+            border-color: #f44336;
+        }
+        .error .result-title {
+            color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>%s</h1>
+        <div class="upload-area" id="uploadArea">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">%s</div>
+            <div class="upload-subtext">%s</div>
+            <input type="file" id="fileInput" accept="image/*" multiple>
+        </div>
+        <button class="upload-button" id="uploadButton">%s</button>
+        <div class="progress-bar" id="progressBar">
+            <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="preview-container" id="previewContainer">
+            <img class="preview-image" id="previewImage" alt="Preview">
+            <div class="file-info" id="fileInfo"></div>
+        </div>
+        <div class="result" id="result">
+            <div class="result-title" id="resultTitle"></div>
+            <div id="resultContent"></div>
+        </div>
+    </div>
+    
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const uploadButton = document.getElementById('uploadButton');
+        const previewContainer = document.getElementById('previewContainer');
+        const previewImage = document.getElementById('previewImage');
+        const fileInfo = document.getElementById('fileInfo');
+        const progressBar = document.getElementById('progressBar');
+        const progressFill = document.getElementById('progressFill');
+        const result = document.getElementById('result');
+        const resultTitle = document.getElementById('resultTitle');
+        const resultContent = document.getElementById('resultContent');
+        
+        let selectedFiles = [];
+        
+        // 点击上传区域
+        uploadArea.addEventListener('click', () => {
+            fileInput.click();
+        });
+        
+        // 拖拽事件
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            handleFiles(e.dataTransfer.files);
+        });
+        
+        // 文件选择
+        fileInput.addEventListener('change', (e) => {
+            handleFiles(e.target.files);
+        });
+        
+        // 处理文件
+        function handleFiles(files) {
+            selectedFiles = Array.from(files).filter(file => file.type.startsWith('image/'));
+            
+            if (selectedFiles.length === 0) {
+                alert('%s');
+                return;
+            }
+            
+            // 显示预览
+            const file = selectedFiles[0];
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                previewImage.src = e.target.result;
+                previewContainer.style.display = 'block';
+                fileInfo.innerHTML = '%s' + file.name + '<br>%s' + formatFileSize(file.size) + '<br>%s' + file.type;
+            };
+            reader.readAsDataURL(file);
+            
+            uploadButton.style.display = 'inline-block';
+            result.style.display = 'none';
+        }
+        
+        // 格式化文件大小
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+        
+        // 上传按钮点击
+        uploadButton.addEventListener('click', async () => {
+            if (selectedFiles.length === 0) return;
+            
+            uploadButton.disabled = true;
+            progressBar.style.display = 'block';
+            result.style.display = 'none';
+            
+            const formData = new FormData();
+            selectedFiles.forEach(file => {
+                formData.append('images', file);
+            });
+            
+            try {
+                const xhr = new XMLHttpRequest();
+                
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const percentComplete = (e.loaded / e.total) * 100;
+                        progressFill.style.width = percentComplete + '%%';
+                    }
+                });
+                
+                xhr.addEventListener('load', () => {
+                    if (xhr.status === 200) {
+                        const response = JSON.parse(xhr.responseText);
+                        showResult(response);
+                    } else {
+                        showError('%s');
+                    }
+                    uploadButton.disabled = false;
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%%';
+                });
+                
+                xhr.addEventListener('error', () => {
+                    showError('%s');
+                    uploadButton.disabled = false;
+                    progressBar.style.display = 'none';
+                    progressFill.style.width = '0%%';
+                });
+                
+                xhr.open('POST', '/api/upload');
+                xhr.send(formData);
+                
+            } catch (error) {
+                showError('%s' + error.message);
+                uploadButton.disabled = false;
+                progressBar.style.display = 'none';
+                progressFill.style.width = '0%%';
+            }
+        });
+        
+        // 显示结果
+        function showResult(response) {
+            result.className = 'result';
+            result.style.display = 'block';
+            resultTitle.textContent = '%s';
+            
+            let html = '';
+            response.urls.forEach(url => {
+                const fullUrl = window.location.origin + url;
+                html += '<div style="margin-bottom: 15px;">';
+                html += '<div>%s</div>';
+                html += '<a href="' + fullUrl + '" target="_blank" class="result-link">' + fullUrl + '</a>';
+                html += '<div style="margin-top: 5px;">';
+                html += '<button onclick="copyToClipboard(\'' + fullUrl + '\')" style="margin-right: 10px; padding: 5px 10px; border: 1px solid #667eea; background: white; color: #667eea; border-radius: 5px; cursor: pointer;">%s</button>';
+                html += '<button onclick="copyToClipboard(\'' + fullUrl + '?format=webp\')" style="padding: 5px 10px; border: 1px solid #667eea; background: white; color: #667eea; border-radius: 5px; cursor: pointer;">%s</button>';
+                html += '</div>';
+                html += '</div>';
+            });
+            resultContent.innerHTML = html;
+        }
+        
+        // 显示错误
+        function showError(message) {
+            result.className = 'result error';
+            result.style.display = 'block';
+            resultTitle.textContent = '%s';
+            resultContent.textContent = message;
+        }
+        
+        // 复制到剪贴板
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                alert('%s');
+            }).catch(() => {
+                alert('%s');
+            });
+        }
+    </script>
+</body>
+</html>`,
+		lang,
+		map[bool]string{true: "图片上传", false: "Image Upload"}[lang == "zh"],
+		map[bool]string{true: "图片上传", false: "Image Upload"}[lang == "zh"],
+		map[bool]string{true: "点击或拖拽图片到这里", false: "Click or drag images here"}[lang == "zh"],
+		map[bool]string{true: "支持 JPG, PNG, GIF, WebP 等格式", false: "Supports JPG, PNG, GIF, WebP formats"}[lang == "zh"],
+		map[bool]string{true: "上传图片", false: "Upload Images"}[lang == "zh"],
+		map[bool]string{true: "请选择图片文件", false: "Please select image files"}[lang == "zh"],
+		map[bool]string{true: "文件名: ", false: "Filename: "}[lang == "zh"],
+		map[bool]string{true: "大小: ", false: "Size: "}[lang == "zh"],
+		map[bool]string{true: "类型: ", false: "Type: "}[lang == "zh"],
+		map[bool]string{true: "上传失败", false: "Upload failed"}[lang == "zh"],
+		map[bool]string{true: "网络错误", false: "Network error"}[lang == "zh"],
+		map[bool]string{true: "上传错误: ", false: "Upload error: "}[lang == "zh"],
+		map[bool]string{true: "上传成功！", false: "Upload successful!"}[lang == "zh"],
+		map[bool]string{true: "图片链接：", false: "Image URL:"}[lang == "zh"],
+		map[bool]string{true: "复制链接", false: "Copy URL"}[lang == "zh"],
+		map[bool]string{true: "复制WebP链接", false: "Copy WebP URL"}[lang == "zh"],
+		map[bool]string{true: "错误", false: "Error"}[lang == "zh"],
+		map[bool]string{true: "已复制到剪贴板", false: "Copied to clipboard"}[lang == "zh"],
+		map[bool]string{true: "复制失败", false: "Copy failed"}[lang == "zh"],
+	)
+	
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, html)
+}
+
+// storeToIOBackend 将文件存储到 io 后端
+func storeToIOBackend(data []byte) (string, error) {
+	// 计算 SHA1
+	hasher := sha1.New()
+	hasher.Write(data)
+	sha1Hash := hex.EncodeToString(hasher.Sum(nil))
+	
+	// 检查文件是否已存在
+	checkURL := fmt.Sprintf("%s/api/exists/%s", ioBackendURL, sha1Hash)
+	req, err := http.NewRequest("GET", checkURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-API-Key", ioAPIKey)
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		resp.Body.Close()
+		// 文件已存在
+		return sha1Hash, nil
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	
+	// 上传文件到 io 后端
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "image")
+	if err != nil {
+		return "", err
+	}
+	if _, err := part.Write(data); err != nil {
+		return "", err
+	}
+	writer.Close()
+	
+	uploadURL := fmt.Sprintf("%s/api/store", ioBackendURL)
+	req, err = http.NewRequest("POST", uploadURL, body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-API-Key", ioAPIKey)
+	
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("上传失败: HTTP %d", resp.StatusCode)
+	}
+	
+	// 解析响应
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	
+	if sha1Str, ok := result["sha1"].(string); ok {
+		return sha1Str, nil
+	}
+	
+	return sha1Hash, nil
+}
+
+// getFromIOBackend 从 io 后端获取文件
+func getFromIOBackend(sha1Hash string) ([]byte, error) {
+	url := fmt.Sprintf("%s/api/file/%s", ioBackendURL, sha1Hash)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-API-Key", ioAPIKey)
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("获取文件失败: HTTP %d", resp.StatusCode)
+	}
+	
+	return io.ReadAll(resp.Body)
+}
+
+// handleAPIUpload 处理图片上传API
+func handleAPIUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	// 解析multipart form，限制32MB
+	err := r.ParseMultipartForm(32 << 20)
+	if err != nil {
+		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+		return
+	}
+	
+	files := r.MultipartForm.File["images"]
+	if len(files) == 0 {
+		http.Error(w, "No files uploaded", http.StatusBadRequest)
+		return
+	}
+	
+	var uploadedURLs []string
+	
+	for _, fileHeader := range files {
+		// 打开上传的文件
+		file, err := fileHeader.Open()
+		if err != nil {
+			log.Printf("打开上传文件失败: %v", err)
+			continue
+		}
+		defer file.Close()
+		
+		// 读取文件内容
+		data, err := io.ReadAll(file)
+		if err != nil {
+			log.Printf("读取上传文件失败: %v", err)
+			continue
+		}
+		
+		// 检测图片格式
+		contentType := http.DetectContentType(data)
+		if !strings.HasPrefix(contentType, "image/") {
+			log.Printf("不支持的文件类型: %s", contentType)
+			continue
+		}
+		
+		// 准备元数据
+		metadata := map[string]string{
+			"filename":     fileHeader.Filename,
+			"content_type": contentType,
+			"size":         strconv.Itoa(len(data)),
+		}
+		
+		// 使用存储管理器存储文件
+		fileID, err := storageManager.Store(data, metadata)
+		if err != nil {
+			log.Printf("存储文件失败: %v", err)
+			continue
+		}
+		
+		// 获取文件扩展名
+		ext := filepath.Ext(fileHeader.Filename)
+		if ext == "" {
+			switch contentType {
+			case "image/jpeg":
+				ext = ".jpg"
+			case "image/png":
+				ext = ".png"
+			case "image/gif":
+				ext = ".gif"
+			case "image/webp":
+				ext = ".webp"
+			default:
+				ext = ".jpg"
+			}
+		}
+		
+		// 保存元数据到数据库
+		fileURL := "/storage/" + fileID + ext
+		_, err = db.Exec(`
+			INSERT OR REPLACE INTO cache (url, file_path, created_at, file_size, content_type, width, height)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, fileURL, fileID, time.Now().Unix(), len(data), contentType, 0, 0)
+		if err != nil {
+			log.Printf("保存元数据失败: %v", err)
+		}
+		
+		uploadedURLs = append(uploadedURLs, fileURL)
+	}
+	
+	if len(uploadedURLs) == 0 {
+		http.Error(w, "No images uploaded successfully", http.StatusInternalServerError)
+		return
+	}
+	
+	// 返回JSON响应
+	response := map[string]interface{}{
+		"success": true,
+		"urls":    uploadedURLs,
+		"count":   len(uploadedURLs),
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleStorageFiles 处理从存储管理器获取文件的请求
+func handleStorageFiles(w http.ResponseWriter, r *http.Request) {
+	// 获取文件路径
+	path := strings.TrimPrefix(r.URL.Path, "/storage/")
+	if path == "" {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	// 提取文件ID（去掉扩展名）
+	fileID := path
+	if idx := strings.LastIndex(path, "."); idx > 0 {
+		fileID = path[:idx]
+	}
+	
+	// 获取查询参数
+	query := r.URL.Query()
+	format := query.Get("format")
+	widthStr := query.Get("w")
+	heightStr := query.Get("h")
+	mode := query.Get("mode")
+	qualityStr := query.Get("q")
+	
+	// 生成变换缓存键（用于缓存变换后的图片）
+	transformKey := fileID
+	if format != "" || widthStr != "" || heightStr != "" || qualityStr != "" {
+		transformKey = fmt.Sprintf("%s_f%s_w%s_h%s_m%s_q%s", 
+			fileID, format, widthStr, heightStr, mode, qualityStr)
+	}
+	
+	// 先尝试从缓存获取变换后的图片
+	var result *StorageResult
+	var err error
+	var isTransformed bool
+	
+	if transformKey != fileID {
+		// 有变换参数，先尝试获取变换后的缓存
+		result, err = storageManager.GetWithLevel(transformKey)
+		if err == nil {
+			isTransformed = true
+			log.Printf("获取变换后的缓存: %s", transformKey)
+		}
+	}
+	
+	// 如果没有变换缓存，获取原始图片
+	if result == nil {
+		result, err = storageManager.GetWithLevel(fileID)
+		if err != nil {
+			log.Printf("获取文件失败: %v", err)
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+	}
+	
+	data := result.Data
+	contentType := http.DetectContentType(data)
+	
+	// 如果需要变换且还没有变换
+	if !isTransformed && (format != "" || widthStr != "" || heightStr != "") {
+		// 解码原始图片
+		img, imgFormat, err := image.Decode(bytes.NewReader(data))
+		if err != nil {
+			log.Printf("解码图片失败: %v", err)
+			http.Error(w, "Failed to decode image", http.StatusInternalServerError)
+			return
+		}
+		
+		// 应用尺寸调整
+		if widthStr != "" || heightStr != "" {
+			width, _ := strconv.Atoi(widthStr)
+			height, _ := strconv.Atoi(heightStr)
+			if mode == "" {
+				mode = "fit"
+			}
+			img = resizeImage(img, width, height, mode)
+		}
+		
+		// 编码为目标格式
+		var buf bytes.Buffer
+		targetFormat := format
+		if targetFormat == "" && imgFormat != "gif" {
+			targetFormat = "webp" // 默认转换为WebP
+		}
+		
+		switch targetFormat {
+		case "webp":
+			if err := nativewebp.Encode(&buf, img, nil); err == nil {
+				data = buf.Bytes()
+				contentType = "image/webp"
+			}
+		case "png":
+			if err := png.Encode(&buf, img); err == nil {
+				data = buf.Bytes()
+				contentType = "image/png"
+			}
+		case "jpeg", "jpg":
+			quality := 85
+			if q, err := strconv.Atoi(qualityStr); err == nil && q > 0 && q <= 100 {
+				quality = q
+			}
+			if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err == nil {
+				data = buf.Bytes()
+				contentType = "image/jpeg"
+			}
+		default:
+			// 保持原格式
+			if targetFormat == "" && format == "webp" && imgFormat != "gif" {
+				if err := nativewebp.Encode(&buf, img, nil); err == nil {
+					data = buf.Bytes()
+					contentType = "image/webp"
+				}
+			}
+		}
+		
+		// 缓存变换后的图片（异步）
+		if buf.Len() > 0 {
+			go func(key string, transformedData []byte) {
+				metadata := map[string]string{
+					"custom_id": key,  // 使用transformKey作为自定义ID
+					"original_id": fileID,
+					"transform": fmt.Sprintf("f=%s,w=%s,h=%s,m=%s,q=%s", 
+						format, widthStr, heightStr, mode, qualityStr),
+				}
+				if storedID, err := storageManager.Store(transformedData, metadata); err == nil {
+					log.Printf("缓存变换后的图片: %s (存储为: %s)", key, storedID)
+				}
+			}(transformKey, data)
+		}
+		
+		// 更新缓存状态为TRANSFORM
+		result.CacheLevel = "Transform"
+	}
+	
+	// 设置响应头
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	w.Header().Set("ETag", generateETag(data))
+	w.Header().Set("X-Cache-Level", result.CacheLevel)  // 缓存层级
+	w.Header().Set("X-Storage-ID", fileID)              // 原始存储ID
+	
+	// 如果有变换，添加变换信息
+	if transformKey != fileID {
+		w.Header().Set("X-Transform-Key", transformKey)
+		w.Header().Set("X-Transform-Params", fmt.Sprintf("format=%s,w=%s,h=%s,mode=%s,q=%s", 
+			format, widthStr, heightStr, mode, qualityStr))
+	}
+	
+	// 根据缓存层级设置状态
+	switch result.CacheLevel {
+	case "Memory":
+		if isTransformed {
+			w.Header().Set("X-Cache-Status", "HIT-MEMORY-TRANSFORM")
+		} else {
+			w.Header().Set("X-Cache-Status", "HIT-MEMORY")
+		}
+	case "Local":
+		if isTransformed {
+			w.Header().Set("X-Cache-Status", "HIT-LOCAL-TRANSFORM")
+		} else {
+			w.Header().Set("X-Cache-Status", "HIT-LOCAL")
+		}
+	case "IOBackend":
+		w.Header().Set("X-Cache-Status", "HIT-REMOTE")
+	case "Transform":
+		w.Header().Set("X-Cache-Status", "TRANSFORM-ON-DEMAND")
+	default:
+		w.Header().Set("X-Cache-Status", "MISS")
+	}
+	
+	// 检查ETag
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if match == w.Header().Get("ETag") {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	
+	// 返回文件内容
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	
+	// 添加图片尺寸信息（如果可用）
+	if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
+		bounds := img.Bounds()
+		w.Header().Set("X-Image-Width", strconv.Itoa(bounds.Dx()))
+		w.Header().Set("X-Image-Height", strconv.Itoa(bounds.Dy()))
+	}
+	
+	w.Write(data)
+}
+
+// handleIOFiles 处理从 io 后端获取文件的请求（兼容旧接口）
+func handleIOFiles(w http.ResponseWriter, r *http.Request) {
+	// 获取文件路径
+	path := strings.TrimPrefix(r.URL.Path, "/io/")
+	if path == "" {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	// 提取 SHA1 哈希（去掉扩展名）
+	sha1Hash := path
+	if idx := strings.LastIndex(path, "."); idx > 0 {
+		sha1Hash = path[:idx]
+	}
+	
+	// 从 io 后端获取文件
+	data, err := getFromIOBackend(sha1Hash)
+	if err != nil {
+		log.Printf("从 io 后端获取文件失败: %v", err)
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	// 检查是否需要转换为WebP
+	format := r.URL.Query().Get("format")
+	contentType := http.DetectContentType(data)
+	
+	if format == "webp" {
+		// 如果不是WebP且不是GIF，则转换
+		if contentType != "image/webp" && contentType != "image/gif" {
+			// 解码图片
+			img, _, err := image.Decode(bytes.NewReader(data))
+			if err == nil {
+				// 编码为WebP
+				var buf bytes.Buffer
+				if err := nativewebp.Encode(&buf, img, nil); err == nil {
+					data = buf.Bytes()
+					contentType = "image/webp"
+				}
+			}
+		}
+	}
+	
+	// 设置缓存头
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	w.Header().Set("ETag", generateETag(data))
+	
+	// 检查ETag
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if match == w.Header().Get("ETag") {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	
+	// 返回文件内容
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
+}
+
+// handleUploads 提供上传的图片访问
+func handleUploads(w http.ResponseWriter, r *http.Request) {
+	// 获取文件名
+	filename := strings.TrimPrefix(r.URL.Path, "/uploads/")
+	if filename == "" {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	// 构建文件路径
+	filePath := filepath.Join("uploads", filename)
+	
+	// 安全检查：确保路径不会越界
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		http.Error(w, "Invalid file path", http.StatusBadRequest)
+		return
+	}
+	uploadsAbsPath, _ := filepath.Abs("uploads")
+	if !strings.HasPrefix(absPath, uploadsAbsPath) {
+		http.Error(w, "Invalid file path", http.StatusBadRequest)
+		return
+	}
+	
+	// 检查文件是否存在
+	fileInfo, err := os.Stat(filePath)
+	if err != nil || fileInfo.IsDir() {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	// 读取文件
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		return
+	}
+	
+	// 检查是否需要转换为WebP
+	format := r.URL.Query().Get("format")
+	if format == "webp" {
+		// 检测当前格式
+		contentType := http.DetectContentType(data)
+		
+		// 如果不是WebP且不是GIF，则转换
+		if contentType != "image/webp" && contentType != "image/gif" {
+			// 解码图片
+			img, _, err := image.Decode(bytes.NewReader(data))
+			if err == nil {
+				// 编码为WebP
+				var buf bytes.Buffer
+				if err := nativewebp.Encode(&buf, img, nil); err == nil {
+					data = buf.Bytes()
+					contentType = "image/webp"
+				}
+			}
+		}
+	}
+	
+	// 设置缓存头
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	w.Header().Set("ETag", generateETag(data))
+	
+	// 检查ETag
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if match == w.Header().Get("ETag") {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	
+	// 返回文件内容
+	contentType := http.DetectContentType(data)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
 }
 
 // Get 从LRU缓存获取条目
