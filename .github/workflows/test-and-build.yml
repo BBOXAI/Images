@@ -1,0 +1,215 @@
+name: Test, Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    
+    - name: Install dependencies
+      run: |
+        go mod download
+        go mod verify
+        # Install test tools
+        sudo apt-get update
+        sudo apt-get install -y jq curl file
+    
+    - name: Build application
+      run: go build -o webpimg main.go
+    
+    - name: Generate test password
+      run: echo "test123" > .pass
+    
+    - name: Run tests
+      id: test
+      continue-on-error: true
+      run: |
+        chmod +x run_tests.sh
+        ./run_tests.sh | tee test-output.log
+        echo "test_status=$?" >> $GITHUB_OUTPUT
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          test-report.md
+          test-output.log
+    
+    - name: Comment PR with test results
+      if: github.event_name == 'pull_request' && always()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{secrets.GITHUB_TOKEN}}
+        script: |
+          const fs = require('fs');
+          const testReport = fs.readFileSync('test-report.md', 'utf8');
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: testReport
+          });
+    
+    - name: Test Summary
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const testReport = fs.readFileSync('test-report.md', 'utf8');
+          await core.summary
+            .addHeading('Test Results')
+            .addRaw(testReport)
+            .write();
+
+  build:
+    name: Build Binaries
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Windows
+          - goos: windows
+            goarch: amd64
+            suffix: .exe
+          - goos: windows
+            goarch: arm64
+            suffix: .exe
+          # Linux
+          - goos: linux
+            goarch: amd64
+            suffix: ''
+          - goos: linux
+            goarch: arm64
+            suffix: ''
+          - goos: linux
+            goarch: arm
+            goarm: 7
+            suffix: ''
+          # macOS
+          - goos: darwin
+            goarch: amd64
+            suffix: ''
+          - goos: darwin
+            goarch: arm64
+            suffix: ''
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    
+    - name: Build
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        GOARM: ${{ matrix.goarm }}
+      run: |
+        if [ "${{ matrix.goarm }}" != "" ]; then
+          output_name="webpimg-${{ matrix.goos }}-${{ matrix.goarch }}v${{ matrix.goarm }}${{ matrix.suffix }}"
+        else
+          output_name="webpimg-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
+        fi
+        go build -ldflags="-s -w" -o "${output_name}" main.go
+        # 压缩二进制文件
+        if [ "${{ matrix.goos }}" != "windows" ]; then
+          tar czf "${output_name}.tar.gz" "${output_name}"
+          rm "${output_name}"
+        else
+          zip "${output_name%.exe}.zip" "${output_name}"
+          rm "${output_name}"
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: binary-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+        path: |
+          *.tar.gz
+          *.zip
+  
+  release:
+    name: Create Release
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Prepare release files
+      run: |
+        # Move binaries to root
+        mv artifacts/binary-*/* . || true
+        # Move test results to root
+        mv artifacts/test-results/* . || true
+        # Create checksums
+        sha256sum *.tar.gz *.zip > checksums.txt || true
+    
+    - name: Read test report
+      id: test_report
+      run: |
+        if [ -f "test-report.md" ]; then
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          cat test-report.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        else
+          echo "report=No test report available" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          *.tar.gz
+          *.zip
+          checksums.txt
+          test-report.md
+        body: |
+          ## Release ${{ github.ref_name }}
+          
+          ### 🧪 Test Results
+          ${{ steps.test_report.outputs.report }}
+          
+          ### 📦 Downloads
+          Multiple platform binaries are available below.
+          
+          ### 🔒 Checksums
+          SHA256 checksums are available in `checksums.txt`
+          
+          ### 📝 What's Changed
+          Please see the commit history for changes.
+        generate_release_notes: false
+        draft: false
+        prerelease: false

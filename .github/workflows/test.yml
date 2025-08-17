@@ -1,0 +1,205 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  statuses: write
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go-version: ['1.22', '1.23']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go-version }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Install dependencies
+      run: |
+        go mod download
+        go mod verify
+    
+    - name: Install test tools (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq curl file
+    
+    - name: Install test tools (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install jq curl
+    
+    - name: Run go vet
+      run: go vet ./...
+    
+    - name: Run go fmt check
+      run: |
+        fmt_files=$(gofmt -l .)
+        if [ -n "$fmt_files" ]; then
+          echo "The following files need formatting:"
+          echo "$fmt_files"
+          exit 1
+        fi
+    
+    - name: Build application
+      run: go build -o webpimg main.go
+    
+    - name: Generate test password
+      run: echo "test123" > .pass
+    
+    - name: Run integration tests
+      id: integration_test
+      continue-on-error: true
+      run: |
+        chmod +x run_tests.sh
+        ./run_tests.sh | tee test-output.log
+    
+    - name: Run unit tests (if any)
+      run: |
+        # Run Go tests if they exist
+        go test ./... -v -cover -coverprofile=coverage.out || true
+        if [ -f coverage.out ]; then
+          go tool cover -html=coverage.out -o coverage.html
+          echo "Coverage report generated"
+        fi
+    
+    - name: Upload test artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-artifacts-${{ matrix.os }}-go${{ matrix.go-version }}
+        path: |
+          test-report.md
+          test-output.log
+          coverage.out
+          coverage.html
+    
+    - name: Test Summary
+      if: always()
+      run: |
+        if [ -f "test-report.md" ]; then
+          cat test-report.md >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Report test status
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          let testReport = '## Test Results\n';
+          testReport += `- OS: ${{ matrix.os }}\n`;
+          testReport += `- Go Version: ${{ matrix.go-version }}\n\n`;
+          
+          if (fs.existsSync('test-report.md')) {
+            testReport += fs.readFileSync('test-report.md', 'utf8');
+          } else {
+            testReport += 'No test report generated';
+          }
+          
+          // Set status check
+          if (context.eventName === 'pull_request') {
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: '${{ steps.integration_test.outcome }}' === 'success' ? 'success' : 'failure',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: `Tests on ${{ matrix.os }} with Go ${{ matrix.go-version }}`,
+              context: `test/${{ matrix.os }}/go-${{ matrix.go-version }}`
+            });
+          }
+
+  test-summary:
+    name: Test Summary
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Download all test artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: test-results
+        pattern: test-artifacts-*
+    
+    - name: Generate combined report
+      run: |
+        echo "# Combined Test Report" > combined-report.md
+        echo "" >> combined-report.md
+        echo "## Test Matrix Results" >> combined-report.md
+        echo "" >> combined-report.md
+        
+        for dir in test-results/*/; do
+          if [ -f "$dir/test-report.md" ]; then
+            echo "### $(basename $dir)" >> combined-report.md
+            cat "$dir/test-report.md" >> combined-report.md
+            echo "" >> combined-report.md
+          fi
+        done
+        
+        cat combined-report.md >> $GITHUB_STEP_SUMMARY
+    
+    - name: Comment on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{secrets.GITHUB_TOKEN}}
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('combined-report.md', 'utf8');
+          
+          // Find and update or create comment
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number
+          });
+          
+          const botComment = comments.find(comment => 
+            comment.user.type === 'Bot' && comment.body.includes('Combined Test Report')
+          );
+          
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: report
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+          }

@@ -1,6 +1,3 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -8,41 +5,86 @@
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
-*.test
+# Main binary
+webpimg
+webpimg-*
+!webpimg*.go
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# Test binaries (compiled test files, but not source)
+test_cleanup
+test_cache
+test_webpimg
+test_storage
+test_cache_levels
+# Keep test source files (.go, .sh, .py)
+!test_*.go
+!test_*.sh
+!test_*.py
+
+# Output of the go coverage tool
 *.out
+coverage.html
+coverage.txt
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Test outputs
+test-output.log
+test-report.md
+*.test
 
 # Go workspace file
 go.work
 go.work.sum
 
-# env file
+# Environment and config files
 .env
-/.trae
+.pass
+
+# Cache and data directories
+/cache
+/uploads
 /logs
-CLAUDE.md
+/.trae
+
+# Database files
 imgproxy.db
 imgproxy.db-shm
 imgproxy.db-wal
-/cache
-.pass
-webpimg
-webpimg.log
-test_cleanup
-test_webpimg.go
-test_webpimg
-test_cleanup.go
-test_cache.go
-test_cache
-/uploads
-test_transform.sh
-test_storage.py
-test_storage.go
-test_cache_levels.go
+*.db
+
+# Build outputs
+/dist
+/build
+*.tar.gz
+*.zip
+checksums.txt
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Test image files (generated during tests)
 test.svg
 test.jpg
+test.png
+*.webp
+
+# But keep the test runner script
+!run_tests.sh
+
+# Config files we want to keep
+!.github/
+!Makefile
+!TESTING.md
+!io_dependency_fix.md

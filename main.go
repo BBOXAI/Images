@@ -678,29 +678,50 @@ func main() {
 	http.HandleFunc("/", handleImageProxy)
 
 	
-	// 自动查找可用端口
+	// 从环境变量或配置文件获取端口
 	port := 8080
-	maxPort := 8100 // 最多尝试到8100端口
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil && p > 0 && p < 65536 {
+			port = p
+		}
+	}
+	
+	// 尝试绑定端口
 	var listener net.Listener
 	var err error
+	addr := fmt.Sprintf(":%d", port)
+	listener, err = net.Listen("tcp", addr)
 	
-	for port <= maxPort {
-		addr := fmt.Sprintf(":%d", port)
-		listener, err = net.Listen("tcp", addr)
-		if err == nil {
-			// 端口可用
-			fmt.Printf("Server started on http://0.0.0.0:%d\n", port)
-			fmt.Printf("Cache management: http://0.0.0.0:%d/cache\n", port)
-			break
+	if err != nil {
+		// 如果指定端口被占用，尝试自动查找
+		log.Printf("Port %d is busy: %v\n", port, err)
+		
+		if os.Getenv("AUTO_PORT") == "true" {
+			// 自动查找可用端口
+			maxPort := port + 20
+			originalPort := port
+			port++
+			
+			for port <= maxPort {
+				addr = fmt.Sprintf(":%d", port)
+				listener, err = net.Listen("tcp", addr)
+				if err == nil {
+					log.Printf("Auto selected port %d (original %d was busy)\n", port, originalPort)
+					break
+				}
+				port++
+			}
+			
+			if listener == nil {
+				log.Fatalf("No available port found between %d and %d", originalPort, maxPort)
+			}
+		} else {
+			log.Fatalf("Port %d is not available: %v", port, err)
 		}
-		// 端口被占用，尝试下一个
-		log.Printf("Port %d is busy, trying %d...\n", port, port+1)
-		port++
 	}
 	
-	if listener == nil {
-		log.Fatalf("No available port found between 8080 and %d", maxPort)
-	}
+	fmt.Printf("Server started on http://0.0.0.0:%d\n", port)
+	fmt.Printf("Cache management: http://0.0.0.0:%d/cache\n", port)
 	
 	// 创建 HTTP 服务器
 	httpServer = &http.Server{
@@ -879,25 +900,43 @@ func loadCacheFromDB() {
 	count := 0
 	for rows.Next() {
 		var entry CacheEntry
-		var lastAccessStr, createdAtStr string
+		var lastAccess, createdAt sql.NullString
+		var thumbPath, format sql.NullString
 		
-		err := rows.Scan(&entry.URL, &entry.FilePath, &entry.ThumbPath, 
-			&entry.Format, &entry.AccessCount, &lastAccessStr, &createdAtStr)
+		err := rows.Scan(&entry.URL, &entry.FilePath, &thumbPath, 
+			&format, &entry.AccessCount, &lastAccess, &createdAt)
 		if err != nil {
 			log.Printf("读取缓存记录失败: %v", err)
 			continue
 		}
 		
-		// 解析时间
-		for _, format := range []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05"} {
-			if entry.LastAccess, err = time.Parse(format, lastAccessStr); err == nil {
-				break
-			}
+		// 处理可能为NULL的字段
+		if thumbPath.Valid {
+			entry.ThumbPath = thumbPath.String
 		}
-		for _, format := range []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05"} {
-			if entry.CreatedAt, err = time.Parse(format, createdAtStr); err == nil {
-				break
+		if format.Valid {
+			entry.Format = format.String
+		}
+		
+		// 解析时间
+		if lastAccess.Valid {
+			for _, fmt := range []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05"} {
+				if entry.LastAccess, err = time.Parse(fmt, lastAccess.String); err == nil {
+					break
+				}
 			}
+		} else {
+			entry.LastAccess = time.Now()
+		}
+		
+		if createdAt.Valid {
+			for _, fmt := range []string{time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02 15:04:05"} {
+				if entry.CreatedAt, err = time.Parse(fmt, createdAt.String); err == nil {
+					break
+				}
+			}
+		} else {
+			entry.CreatedAt = time.Now()
 		}
 		
 		entry.Dirty = false
@@ -2391,16 +2430,32 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取缓存大小
-	rows, err := queryWithRetry("SELECT file_path FROM cache")
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var filePath string
-			if err := rows.Scan(&filePath); err != nil {
-				continue
+	// 直接扫描缓存目录计算准确大小
+	if cacheDir != "" {
+		filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
 			}
-			if info, err := os.Stat(filePath); err == nil {
+			if !info.IsDir() && strings.HasSuffix(path, ".webp") {
 				cacheSize += info.Size()
+			}
+			return nil
+		})
+	}
+	
+	// 如果扫描失败或没有找到文件，从数据库读取
+	if cacheSize == 0 {
+		rows, err := queryWithRetry("SELECT file_path FROM cache")
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var filePath string
+				if err := rows.Scan(&filePath); err != nil {
+					continue
+				}
+				if info, err := os.Stat(filePath); err == nil {
+					cacheSize += info.Size()
+				}
 			}
 		}
 	}
